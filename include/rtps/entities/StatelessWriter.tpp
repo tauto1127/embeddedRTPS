@@ -33,6 +33,8 @@ Author: i11 - Embedded Software, RWTH Aachen University
 #include "rtps/utils/Log.h"
 #include "rtps/utils/udpUtils.h"
 
+#include <algorithm>
+
 using rtps::CacheChange;
 using rtps::SequenceNumber_t;
 using rtps::StatelessWriterT;
@@ -221,6 +223,20 @@ const rtps::CacheChange *StatelessWriterT<NetworkDriver>::newChangeIdentify(
   }
 
   auto *result = m_history.addChange(data, size, identify);
+  const bool empty_sample_identity =
+      std::all_of(identify.guidPrefix.id.begin(), identify.guidPrefix.id.end(),
+                  [](uint8_t byte) { return byte == 0; }) &&
+      std::all_of(identify.writerId.entityKey.begin(),
+                  identify.writerId.entityKey.end(),
+                  [](uint8_t byte) { return byte == 0; }) &&
+      identify.writerId.entityKind == rtps::EntityKind_t::USER_DEFINED_UNKNOWN;
+  if (empty_sample_identity && result != nullptr)
+  {
+    auto *change = const_cast<CacheChange *>(result);
+    change->identify.guidPrefix = m_attributes.endpointGuid.prefix;
+    change->identify.writerId = m_attributes.endpointGuid.entityId;
+    change->identify.sn = change->sequenceNumber;
+  }
   if (mp_threadPool != nullptr)
   {
     mp_threadPool->addWorkload(this);

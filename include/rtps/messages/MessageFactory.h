@@ -252,6 +252,7 @@ namespace rtps
         uint32_t sequenceNumber_low = identify.sn.low;
 
         uint16_t PID_SENTINEL = 0x0001;
+        uint16_t PID_SENTINEL_LENGTH = 0;
 
         buffer.append(reinterpret_cast<uint8_t *>(&PID_CUSTOM_RELATED_SAMPLE_IDENTITY),
                       sizeof(PID_CUSTOM_RELATED_SAMPLE_IDENTITY));
@@ -273,6 +274,12 @@ namespace rtps
         buffer.append(reinterpret_cast<uint8_t *>(&sequenceNumber_low), sizeof(sequenceNumber_low));
 
         buffer.append(reinterpret_cast<uint8_t *>(&PID_SENTINEL), sizeof(PID_SENTINEL));
+        // ParameterList entries always contain a PID and a uint16 length.
+        // The previous code advertised 32 inline-QoS bytes but appended only
+        // 30, letting the first two CDR payload bytes masquerade as this
+        // sentinel length and making the DATA submessage malformed.
+        buffer.append(reinterpret_cast<uint8_t *>(&PID_SENTINEL_LENGTH),
+                      sizeof(PID_SENTINEL_LENGTH));
       }
       if (filledPayload.isValid())
       {

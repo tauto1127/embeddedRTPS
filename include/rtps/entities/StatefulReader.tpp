@@ -83,11 +83,71 @@ void StatefulReaderT<NetworkDriver>::newChange(
   {
     if (proxy.remoteWriterGuid == cacheChange.writerGuid)
     {
-      if (proxy.expectedSN == cacheChange.sn)
+      const bool is_service_reply =
+          m_attributes.topicName[0] == 'r' &&
+          m_attributes.topicName[1] == 'r' &&
+          m_attributes.topicName[2] == '/';
+      const bool service_reply_after_gap =
+          is_service_reply && proxy.expectedSN < cacheChange.sn;
+
+      // Service replies are correlated by PID_RELATED_SAMPLE_IDENTITY rather
+      // than by the response writer's RTPS sequence number.  If an earlier
+      // reply was lost (or intentionally abandoned after an application
+      // timeout), blocking every later independent reply behind that gap makes
+      // the client fail permanently.  This reader has no out-of-order cache,
+      // so service replies resynchronize at the newest delivered sample.
+      if (service_reply_after_gap)
+      {
+        printf("[RTPS RX] service response gap skipped: expected=%d:%u received=%d:%u\n",
+               proxy.expectedSN.high, proxy.expectedSN.low,
+               cacheChange.sn.high, cacheChange.sn.low);
+      }
+
+      if (proxy.expectedSN == cacheChange.sn || service_reply_after_gap)
       {
         m_callback(m_callee, cacheChange);
+        proxy.expectedSN = cacheChange.sn;
         ++proxy.expectedSN;
+
+        // A ROS 2 service reply reader must release the server writer's
+        // reliable history promptly.  Waiting for a later HEARTBEAT can leave
+        // the last delivered reply unacknowledged indefinitely; with the
+        // default service history depth this eventually stalls replies after
+        // roughly ten calls.  Send a cumulative final ACK immediately after
+        // accepting each Reply sample.
+        if (is_service_reply)
+        {
+          PacketInfo info;
+          info.srcPort = m_packetInfo.srcPort;
+          info.destAddr = proxy.remoteLocator.getIp4Address();
+          info.destPort = proxy.remoteLocator.port;
+
+          SequenceNumberSet acked;
+          acked.base = proxy.expectedSN;
+          acked.numBits = 0;
+          const Count_t count = proxy.getNextAckNackCount();
+
+          rtps::MessageFactory::addHeader(
+              info.buffer, m_attributes.endpointGuid.prefix);
+          rtps::MessageFactory::addAckNack(
+              info.buffer, proxy.remoteWriterGuid.entityId,
+              m_attributes.endpointGuid.entityId, acked, count, true);
+
+          printf("[RTPS RX] service response ACK: received=%d:%u base=%d:%u count=%d src_port=%u dst_port=%u\n",
+                 cacheChange.sn.high, cacheChange.sn.low,
+                 acked.base.high, acked.base.low, count.value,
+                 static_cast<unsigned int>(info.srcPort),
+                 static_cast<unsigned int>(info.destPort));
+          m_transport->sendPacket(info);
+        }
         return;
+      }
+
+      if (is_service_reply)
+      {
+        printf("[RTPS RX] service response DATA ignored: received=%d:%u expected=%d:%u\n",
+               cacheChange.sn.high, cacheChange.sn.low,
+               proxy.expectedSN.high, proxy.expectedSN.low);
       }
     }
   }

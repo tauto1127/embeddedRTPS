@@ -31,6 +31,39 @@ Author: i11 - Embedded Software, RWTH Aachen University
 
 using rtps::ThreadPool;
 
+namespace {
+
+bool containsDataFrag(const uint8_t *data, size_t size) {
+  // RTPS header is 20 bytes. Parse only enough submessage headers to identify
+  // DATA_FRAG (0x16); malformed packets are left to the normal RTPS parser.
+  constexpr size_t kRtpHeaderSize = 20;
+  constexpr uint8_t kDataFrag = 0x16;
+  if (data == nullptr || size <= kRtpHeaderSize) {
+    return false;
+  }
+
+  size_t offset = kRtpHeaderSize;
+  while (offset + 4 <= size) {
+    const uint8_t id = data[offset];
+    const uint8_t flags = data[offset + 1];
+    const uint16_t payload_size = (flags & 0x01) != 0
+                                      ? static_cast<uint16_t>(data[offset + 2]) |
+                                            (static_cast<uint16_t>(data[offset + 3]) << 8)
+                                      : (static_cast<uint16_t>(data[offset + 2]) << 8) |
+                                            static_cast<uint16_t>(data[offset + 3]);
+    if (id == kDataFrag) {
+      return true;
+    }
+    if (payload_size == 0 || offset + 4 + payload_size > size) {
+      return false;
+    }
+    offset += 4 + payload_size;
+  }
+  return false;
+}
+
+} // namespace
+
 #define THREAD_POOL_VERBOSE 0
 #if THREAD_POOL_VERBOSE && RTPS_GLOBAL_VERBOSE
 #define THREAD_POOL_LOG(...)
@@ -123,6 +156,8 @@ bool ThreadPool::addWorkload(Writer *workload) {
   bool res = m_queueOutgoing.moveElementIntoBuffer(std::move(workload));
   if (res) {
     sys_sem_signal(&m_writerNotificationSem);
+  } else {
+    printf("[RTPS TX] DROP: outgoing writer-work queue is full\n");
   }
 
   return res;
@@ -167,22 +202,51 @@ void ThreadPool::readCallback(void *args, udp_pcb *target, pbuf *pbuf,
 
   PacketInfo packet;
 
-  // TODO This is a workaround for chained pbufs caused by hardware limitations,
-  // not a general fix
+  // Domain::receiveCallback consumes packet.buffer.firstElement->payload/len,
+  // therefore it requires one contiguous pbuf.  PBUF_POOL is unsuitable for
+  // coalescing: allocating a frame larger than PBUF_POOL_BUFSIZE simply creates
+  // another chain and only its first fragment was subsequently parsed.  Large
+  // DDS service replies (e.g. Cartographer SubmapQuery textures) were thus
+  // silently truncated before RTPS deserialization.
   if (pbuf->next != nullptr) {
-    struct pbuf *test = pbuf_alloc(PBUF_RAW, pbuf->tot_len, PBUF_POOL);
-    pbuf_copy(test, pbuf);
+    const u16_t packet_length = pbuf->tot_len;
+    printf("[RTPS RX] coalescing chained UDP packet: local_port=%u remote_port=%u bytes=%u\n",
+           target->local_port, port, packet_length);
+    struct pbuf *test = pbuf_alloc(PBUF_RAW, packet_length, PBUF_RAM);
+    if (test == nullptr) {
+      printf("[RTPS RX] DROP: cannot allocate contiguous buffer: bytes=%u\n",
+             packet_length);
+      pbuf_free(pbuf);
+      return;
+    }
+    if (pbuf_copy(test, pbuf) != ERR_OK) {
+      printf("[RTPS RX] DROP: cannot copy chained UDP packet: bytes=%u\n",
+             packet_length);
+      pbuf_free(test);
+      pbuf_free(pbuf);
+      return;
+    }
     pbuf_free(pbuf);
     pbuf = test;
+    printf("[RTPS RX] coalesced UDP packet: bytes=%u\n", packet_length);
   }
 
   packet.destAddr = {0}; // not relevant
   packet.destPort = target->local_port;
   packet.srcPort = port;
   packet.buffer = PBufWrapper{pbuf};
+  const u16_t packet_length = pbuf->tot_len;
+  const Ip4Port_t local_port = target->local_port;
+
+  if (containsDataFrag(static_cast<const uint8_t *>(pbuf->payload),
+                       packet_length)) {
+    printf("[RTPS RX] DATA_FRAG: local_port=%u remote_port=%u bytes=%u\n",
+           local_port, port, packet_length);
+  }
 
   if (!pool.addNewPacket(std::move(packet))) {
-    THREAD_POOL_LOG("ThreadPool: dropped packet\n");
+    printf("[RTPS RX] DROP: incoming RTPS queue is full: local_port=%u remote_port=%u bytes=%u\n",
+           local_port, port, packet_length);
   }
 }
 

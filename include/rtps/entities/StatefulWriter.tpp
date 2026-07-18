@@ -26,6 +26,7 @@ Author: i11 - Embedded Software, RWTH Aachen University
 #include "rtps/entities/StatefulWriter.h"
 #include "rtps/messages/MessageFactory.h"
 #include "rtps/utils/Log.h"
+#include <algorithm>
 #include <cstring>
 #include <stdio.h>
 
@@ -247,6 +248,24 @@ const rtps::CacheChange *StatefulWriterT<NetworkDriver>::newChangeIdentify(
   }
 
   auto *result = m_history.addChange(data, size, identify);
+  // A client request enters here with an empty SampleIdentity.  Fill it only
+  // after the history assigned the real writer sequence number.  A service
+  // response already carries the request identity received by the server and
+  // must preserve that identity verbatim.
+  const bool empty_sample_identity =
+      std::all_of(identify.guidPrefix.id.begin(), identify.guidPrefix.id.end(),
+                  [](uint8_t byte) { return byte == 0; }) &&
+      std::all_of(identify.writerId.entityKey.begin(),
+                  identify.writerId.entityKey.end(),
+                  [](uint8_t byte) { return byte == 0; }) &&
+      identify.writerId.entityKind == rtps::EntityKind_t::USER_DEFINED_UNKNOWN;
+  if (empty_sample_identity && result != nullptr)
+  {
+    auto *change = const_cast<CacheChange *>(result);
+    change->identify.guidPrefix = m_attributes.endpointGuid.prefix;
+    change->identify.writerId = m_attributes.endpointGuid.entityId;
+    change->identify.sn = change->sequenceNumber;
+  }
   if (mp_threadPool != nullptr)
   {
     mp_threadPool->addWorkload(this);
@@ -303,6 +322,21 @@ template <class NetworkDriver>
 void StatefulWriterT<NetworkDriver>::progress()
 {
 
+  // newChangeIdentify() marks service traffic with this project-specific
+  // SampleIdentity high word.  A generated request is otherwise silently
+  // skipped when discovery has removed (or never installed) its reader proxy.
+  if (m_proxies.isEmpty())
+  {
+    Lock lock(m_mutex);
+    const CacheChange *next =
+        m_history.getChangeBySN(m_nextSequenceNumberToSend);
+    if (next != nullptr && next->serviceRespFlag)
+    {
+      printf("[RTPS TX] service request UNSENT: no matched reader proxy: request_id=%u\n",
+             next->sequenceNumber.low);
+    }
+  }
+
   for (const auto &proxy : m_proxies)
   {
     bool success;
@@ -348,6 +382,8 @@ template <class NetworkDriver>
 void StatefulWriterT<NetworkDriver>::onNewAckNack(
     const SubmessageAckNack &msg, const GuidPrefix_t &sourceGuidPrefix)
 {
+  const bool service_request_writer =
+      std::strncmp(m_attributes.topicName, "rq/", 3) == 0;
   ReaderProxy *reader = nullptr;
   for (auto &proxy : m_proxies)
   {
@@ -361,12 +397,26 @@ void StatefulWriterT<NetworkDriver>::onNewAckNack(
 
   if (reader == nullptr)
   {
+    if (service_request_writer)
+    {
+      printf("[RTPS TX] service ACKNACK ignored: no matching reader proxy: base=%d:%u count=%u\n",
+             msg.readerSNState.base.high, msg.readerSNState.base.low,
+             msg.count.value);
+    }
 #if SFW_VERBOSE && RTPS_GLOBAL_VERBOSE
     SFW_LOG("No proxy found with id: ");
     printEntityId(msg.readerId);
     SFW_LOG(" Dropping acknack.\n");
 #endif
     return;
+  }
+
+  if (service_request_writer)
+  {
+    printf("[RTPS TX] service ACKNACK: base=%d:%u num_bits=%u bitmap=0x%08x count=%u previous_count=%u\n",
+           msg.readerSNState.base.high, msg.readerSNState.base.low,
+           msg.readerSNState.numBits, msg.readerSNState.bitMap[0],
+           msg.count.value, reader->ackNackCount.value);
   }
 
   uint8_t hash = 0;
@@ -399,7 +449,16 @@ void StatefulWriterT<NetworkDriver>::onNewAckNack(
 
   if (nextSN.low == 0 && nextSN.high == 0)
   {
-    SFW_LOG("Received preemptive acknack. Ignored.\n");
+    // A zero/empty ACKNACK is the RTPS preemptive handshake.  It does not
+    // describe missing sequence numbers.  Falling through from SN 0 caused
+    // every retained service request to be retransmitted on each handshake.
+    // Answer it with a HEARTBEAT so the reader can return a real ACKNACK.
+    if (service_request_writer)
+    {
+      printf("[RTPS TX] service preemptive ACKNACK: send HEARTBEAT instead of replaying history\n");
+    }
+    sendHeartBeat();
+    return;
   }
   else
   {
@@ -449,6 +508,8 @@ bool StatefulWriterT<NetworkDriver>::sendData(
   info.destAddr = locator.getIp4Address();
   info.destPort = (Ip4Port_t)locator.port;
 
+  bool is_service_request = false;
+  uint32_t request_id = 0;
   {
     Lock lock(m_mutex);
     const CacheChange *next = m_history.getChangeBySN(snMissing);
@@ -479,8 +540,20 @@ bool StatefulWriterT<NetworkDriver>::sendData(
           info.buffer, next->data, false, next->sequenceNumber,
           m_attributes.endpointGuid.entityId, reader.remoteReaderGuid.entityId, next->identify);
     }
+    is_service_request = next->serviceRespFlag &&
+                         next->identify.guidPrefix == m_attributes.endpointGuid.prefix &&
+                         next->identify.writerId.entityKey == m_attributes.endpointGuid.entityId.entityKey &&
+                         next->identify.writerId.entityKind == m_attributes.endpointGuid.entityId.entityKind &&
+                         next->identify.sn == next->sequenceNumber;
+    request_id = next->sequenceNumber.low;
   }
 
+  if (is_service_request)
+  {
+    printf("[RTPS TX] service request RETRANSMIT: request_id=%u src_port=%u dst_port=%u bytes=%u\n",
+           request_id, info.srcPort, info.destPort,
+           info.buffer.firstElement->tot_len);
+  }
   m_transport->sendPacket(info);
   return true;
 }
@@ -512,6 +585,8 @@ bool StatefulWriterT<NetworkDriver>::sendDataWRMulticast(
       info.destPort = (Ip4Port_t)locator.port;
     }
 
+    bool is_service_request = false;
+    uint32_t request_id = 0;
     {
       Lock lock(m_mutex);
       const CacheChange *next = m_history.getChangeBySN(snMissing);
@@ -548,8 +623,28 @@ bool StatefulWriterT<NetworkDriver>::sendDataWRMulticast(
             info.buffer, next->data, false, next->sequenceNumber,
             m_attributes.endpointGuid.entityId, reid, next->identify);
       }
+      is_service_request = next->serviceRespFlag &&
+                           next->identify.guidPrefix == m_attributes.endpointGuid.prefix &&
+                           next->identify.writerId.entityKey == m_attributes.endpointGuid.entityId.entityKey &&
+                           next->identify.writerId.entityKind == m_attributes.endpointGuid.entityId.entityKind &&
+                           next->identify.sn == next->sequenceNumber;
+      request_id = next->sequenceNumber.low;
+    }
+    if (is_service_request)
+    {
+      printf("[RTPS TX] service request SENT: request_id=%u src_port=%u dst_port=%u bytes=%u\n",
+             request_id, info.srcPort, info.destPort,
+             info.buffer.firstElement->tot_len);
     }
     m_transport->sendPacket(info);
+    // Do not depend solely on the per-writer heartbeat thread.  In the WASI
+    // threads runtime that thread may be delayed, while a reliable DDS reader
+    // needs a HEARTBEAT to turn its preemptive ACKNACK (base 0:0) into an ACK
+    // for the actual request sequence number.
+    if (is_service_request)
+    {
+      sendHeartBeat();
+    }
   }
   return true;
 }
@@ -617,6 +712,12 @@ void StatefulWriterT<NetworkDriver>::sendHeartBeat()
 
     info.destAddr = proxy.remoteLocator.getIp4Address();
     info.destPort = proxy.remoteLocator.port;
+    if (std::strncmp(m_attributes.topicName, "rq/", 3) == 0)
+    {
+      printf("[RTPS TX] service HEARTBEAT: first=%d:%u last=%d:%u count=%u src_port=%u dst_port=%u\n",
+             firstSN.high, firstSN.low, lastSN.high, lastSN.low,
+             m_hbCount.value, info.srcPort, info.destPort);
+    }
     m_transport->sendPacket(info);
   }
   m_hbCount.value++;

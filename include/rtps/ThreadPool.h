@@ -57,6 +57,13 @@ public:
                            const ip_addr_t *addr, Ip4Port_t port);
 
 private:
+  // Starting Cartographer and Gazebo introduces several DDS participants at
+  // once.  Their discovery burst exceeded the generated platform config's
+  // small writer-work queue bound and dropped the first user-data packets.
+  // Keep receive capacity independent: PacketInfo stores a pbuf handle rather
+  // than the packet payload, so this static queue has a modest memory cost.
+  static constexpr uint16_t kIncomingQueueLength = 512;
+
   receiveJumppad_fp m_receiveJumppad;
   void *m_callee;
   bool m_running = false;
@@ -68,8 +75,7 @@ private:
 
   ThreadSafeCircularBuffer<Writer *, Config::THREAD_POOL_WORKLOAD_QUEUE_LENGTH>
       m_queueOutgoing;
-  ThreadSafeCircularBuffer<PacketInfo,
-                           Config::THREAD_POOL_WORKLOAD_QUEUE_LENGTH>
+  ThreadSafeCircularBuffer<PacketInfo, kIncomingQueueLength>
       m_queueIncoming;
 
   static void writerThreadFunction(void *arg);

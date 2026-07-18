@@ -87,7 +87,11 @@ const int THREAD_POOL_NUM_WRITERS = 2;
 const int THREAD_POOL_NUM_READERS = 2;
 const int THREAD_POOL_WRITER_PRIO = 3;
 const int THREAD_POOL_READER_PRIO = 3;
-const int THREAD_POOL_WORKLOAD_QUEUE_LENGTH = 10;
+// A service request must not be dropped merely because discovery, publishing,
+// and retransmission work arrive in a short burst.  10 entries made this
+// likely under Cartographer traffic; entries are pointers/PacketInfo handles,
+// so the larger bound has a small static-memory cost.
+const int THREAD_POOL_WORKLOAD_QUEUE_LENGTH = 128;
 
 constexpr int OVERALL_HEAP_SIZE =
     THREAD_POOL_NUM_WRITERS * THREAD_POOL_WRITER_STACKSIZE +
