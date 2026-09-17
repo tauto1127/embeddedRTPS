@@ -31,6 +31,8 @@ Author: i11 - Embedded Software, RWTH Aachen University
 #include "rtps/messages/MessageTypes.h"
 #include "rtps/utils/Log.h"
 #include "rtps/utils/udpUtils.h"
+#include "rtps/communication/TcpipCoreLock.h"
+#include "netif_wasm_add.h"
 
 using rtps::SPDPAgent;
 using rtps::SMElement::BuildInEndpointSet;
@@ -75,13 +77,43 @@ void SPDPAgent::start()
 
 void SPDPAgent::stop() { m_running = false; }
 
+bool SPDPAgent::refreshLocalIp()
+{
+  int result;
+  {
+    TcpipCoreLock lock;
+    result = netif_wasm_refresh();
+  }
+  const int pending = netif_wasm_take_ip_changed();
+  if (result < 0) {
+    SPDP_LOG("Could not refresh local IP address\n");
+    return false;
+  }
+  if (result == 0 && pending == 0) {
+    return false;
+  }
+
+  mp_participant->refreshLocalLocators();
+
+  /* Rebuild the participant data so the next announcement carries the new
+   * unicast locator. The writer copies the buffer in newChange(). */
+  ucdr_init_buffer(&m_microbuffer, m_outputBuffer.data(),
+                   m_outputBuffer.size());
+  addParticipantParameters();
+  SPDP_LOG("Rebuilt participant announcement after local IP change\n");
+  return true;
+}
+
 // mros::initから呼び出し　PDPパケットを送信？
 void SPDPAgent::runBroadcast(void *args)
 {
   SPDPAgent &agent = *static_cast<SPDPAgent *>(args);
-  const DataSize_t size = ucdr_buffer_length(&agent.m_microbuffer);
-  agent.m_buildInEndpoints.spdpWriter->newChange(
-      ChangeKind_t::ALIVE, agent.m_microbuffer.init, size);
+  auto announce = [&agent]() {
+    const DataSize_t size = ucdr_buffer_length(&agent.m_microbuffer);
+    agent.m_buildInEndpoints.spdpWriter->newChange(
+        ChangeKind_t::ALIVE, agent.m_microbuffer.init, size);
+  };
+  announce();
   while (agent.m_running)
   {
 #ifdef OS_IS_FREERTOS
@@ -89,6 +121,9 @@ void SPDPAgent::runBroadcast(void *args)
 #else
     sys_msleep(Config::SPDP_RESEND_PERIOD_MS);
 #endif
+    if (agent.refreshLocalIp()) {
+      announce();
+    }
     agent.m_buildInEndpoints.spdpWriter->setAllChangesToUnsent();
     if (agent.m_cycleHB == Config::SPDP_CYCLECOUNT_HEARTBEAT)
     {
@@ -185,8 +220,40 @@ void SPDPAgent::processProxyData()
       mp_participant->findRemoteParticipant(m_proxyDataBuffer.m_guid.prefix);
   if (remote_part != nullptr)
   {
+    const auto locator_list_changed = [](const auto &old_list,
+                                         const auto &new_list) {
+      for (size_t i = 0; i < old_list.size(); ++i)
+      {
+        if (old_list[i].kind != new_list[i].kind ||
+            old_list[i].port != new_list[i].port ||
+            old_list[i].address != new_list[i].address)
+        {
+          return true;
+        }
+      }
+      return false;
+    };
+    const bool metatraffic_locator_changed = locator_list_changed(
+        remote_part->m_metatrafficUnicastLocatorList,
+        m_proxyDataBuffer.m_metatrafficUnicastLocatorList);
+    const bool default_locator_changed = locator_list_changed(
+        remote_part->m_defaultUnicastLocatorList,
+        m_proxyDataBuffer.m_defaultUnicastLocatorList);
     SPDP_LOG("Not adding remote participant guid.prefix = %u \n",
              (unsigned int)Guid_t::sum(remote_part->m_guid));
+
+    if (metatraffic_locator_changed || default_locator_changed)
+    {
+      const GuidPrefix_t prefix = m_proxyDataBuffer.m_guid.prefix;
+      mp_participant->removeRemoteParticipant(prefix);
+      if (mp_participant->addNewRemoteParticipant(m_proxyDataBuffer))
+      {
+        addProxiesForBuiltInEndpoints();
+        m_buildInEndpoints.spdpWriter->setAllChangesToUnsent();
+      }
+      return;
+    }
+
     mp_participant->refreshRemoteParticipantLiveliness(
         m_proxyDataBuffer.m_guid.prefix);
     return; // Already in our list

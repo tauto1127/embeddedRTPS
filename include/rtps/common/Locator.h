@@ -28,6 +28,7 @@ Author: i11 - Embedded Software, RWTH Aachen University
 #include "rtps/communication/UdpDriver.h"
 #include "rtps/utils/udpUtils.h"
 #include "ucdr/microcdr.h"
+#include "lwip/netif.h"
 
 #include <array>
 
@@ -107,11 +108,20 @@ struct FullLengthLocator {
 
 } __attribute__((packed));
 
+inline std::array<uint8_t, 4> getLocalIpAddress() {
+  if (netif_default == nullptr) {
+    return {0, 0, 0, 0};
+  }
+  const ip4_addr_t &address = netif_default->ip_addr;
+  return {ip4_addr1(&address), ip4_addr2(&address), ip4_addr3(&address),
+          ip4_addr4(&address)};
+}
+
 inline FullLengthLocator
 getBuiltInUnicastLocator(ParticipantId_t participantId) {
+  const auto ip = getLocalIpAddress();
   return FullLengthLocator::createUDPv4Locator(
-      Config::IP_ADDRESS[0], Config::IP_ADDRESS[1], Config::IP_ADDRESS[2],
-      Config::IP_ADDRESS[3], getBuiltInUnicastPort(participantId));
+      ip[0], ip[1], ip[2], ip[3], getBuiltInUnicastPort(participantId));
 }
 
 inline FullLengthLocator getBuiltInMulticastLocator() {
@@ -120,17 +130,17 @@ inline FullLengthLocator getBuiltInMulticastLocator() {
 }
 
 inline FullLengthLocator getUserUnicastLocator(ParticipantId_t participantId) {
+  const auto ip = getLocalIpAddress();
   return FullLengthLocator::createUDPv4Locator(
-      Config::IP_ADDRESS[0], Config::IP_ADDRESS[1], Config::IP_ADDRESS[2],
-      Config::IP_ADDRESS[3], getUserUnicastPort(participantId));
+      ip[0], ip[1], ip[2], ip[3], getUserUnicastPort(participantId));
 }
 
 inline FullLengthLocator
 getUserMulticastLocator() { // this would be a unicastaddress, as
                             // defined in config
+  const auto ip = getLocalIpAddress();
   return FullLengthLocator::createUDPv4Locator(
-      Config::IP_ADDRESS[0], Config::IP_ADDRESS[1], Config::IP_ADDRESS[2],
-      Config::IP_ADDRESS[3], getUserMulticastPort());
+      ip[0], ip[1], ip[2], ip[3], getUserMulticastPort());
 }
 
 inline FullLengthLocator getDefaultSendMulticastLocator() {

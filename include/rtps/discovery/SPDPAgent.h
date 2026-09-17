@@ -84,6 +84,7 @@ namespace rtps
     void addInlineQos();
     void addParticipantParameters();
     void endCurrentList();
+    bool refreshLocalIp();
 
     static void runBroadcast(void *args);
   };

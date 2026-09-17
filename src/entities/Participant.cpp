@@ -26,6 +26,7 @@ Author: i11 - Embedded Software, RWTH Aachen University
 
 #include "rtps/entities/Reader.h"
 #include "rtps/entities/Writer.h"
+#include "rtps/common/Locator.h"
 #include "rtps/messages/MessageReceiver.h"
 #include "rtps/utils/Log.h"
 
@@ -414,6 +415,36 @@ void Participant::addBuiltInEndpoints(BuiltInEndpoints &endpoints)
   addReader(endpoints.sedpPubReader);
   addWriter(endpoints.sedpSubWriter);
   addReader(endpoints.sedpSubReader);
+}
+
+void Participant::refreshLocalLocators()
+{
+  const FullLengthLocator userLocator =
+      getUserUnicastLocator(m_participantId);
+
+  for (uint8_t i = 0; i < m_numWriters; ++i)
+  {
+    const EntityKind_t kind =
+        m_writers[i]->m_attributes.endpointGuid.entityId.entityKind;
+    if (kind != EntityKind_t::BUILD_IN_WRITER_WITH_KEY &&
+        kind != EntityKind_t::BUILD_IN_WRITER_WITHOUT_KEY)
+    {
+      m_writers[i]->m_attributes.unicastLocator = userLocator;
+      m_sedpAgent.addWriter(*m_writers[i]);
+    }
+  }
+
+  for (uint8_t i = 0; i < m_numReaders; ++i)
+  {
+    const EntityKind_t kind =
+        m_readers[i]->m_attributes.endpointGuid.entityId.entityKind;
+    if (kind != EntityKind_t::BUILD_IN_READER_WITH_KEY &&
+        kind != EntityKind_t::BUILD_IN_READER_WITHOUT_KEY)
+    {
+      m_readers[i]->m_attributes.unicastLocator = userLocator;
+      m_sedpAgent.addReader(*m_readers[i]);
+    }
+  }
 }
 
 void Participant::newMessage(const uint8_t *data, DataSize_t size)

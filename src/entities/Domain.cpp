@@ -522,6 +522,10 @@ rtps::GuidPrefix_t Domain::generateGuidPrefix(ParticipantId_t id) const
   srand(time(nullptr));
 #else
   unsigned int seed = (int)xTaskGetTickCount();
+  if (netif_default != nullptr)
+  {
+    seed ^= netif_default->ip_addr.addr;
+  }
   srand(seed);
 #endif
   for (auto i = 0; i < rtps::Config::BASE_GUID_PREFIX.id.size(); i++)
