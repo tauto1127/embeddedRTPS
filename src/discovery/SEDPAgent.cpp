@@ -24,7 +24,14 @@ Author: i11 - Embedded Software, RWTH Aachen University
 
 #include "rtps/discovery/SEDPAgent.h"
 #include "rtps/discovery/TopicData.h"
+#include "rtps/discovery/PreparedDiscovery.h"
+#include "rtps/discovery/SPDPAgent.h"
 #include "rtps/entities/Participant.h"
+#include "rtps/entities/StatefulWriter.h"
+#include "rtps/entities/StatelessWriter.h"
+#include "netif_wasm_add.h"
+#include <array>
+#include <utility>
 #include "rtps/entities/Reader.h"
 #include "rtps/entities/Writer.h"
 #include "rtps/messages/MessageTypes.h"
@@ -45,13 +52,18 @@ using rtps::SEDPAgent;
 #define SEDP_LOG(...) //
 #endif
 
-void SEDPAgent::init(Participant &part, const BuiltInEndpoints &endpoints)
+bool SEDPAgent::init(Participant &part, const BuiltInEndpoints &endpoints)
 {
-  // TODO move
+  if (m_part != nullptr || endpoints.sedpPubWriter == nullptr ||
+      endpoints.sedpPubReader == nullptr || endpoints.sedpSubWriter == nullptr ||
+      endpoints.sedpSubReader == nullptr)
+  {
+    return false;
+  }
   if (sys_mutex_new(&m_mutex) != ERR_OK)
   {
     SEDP_LOG("SEDPAgent failed to create mutex\n");
-    return;
+    return false;
   }
 
   m_part = &part;
@@ -60,11 +72,9 @@ void SEDPAgent::init(Participant &part, const BuiltInEndpoints &endpoints)
   {
     m_endpoints.sedpPubReader->registerCallback(receiveCallbackPublisher, this);
   }
-  if (m_endpoints.sedpSubReader != nullptr)
-  {
-    m_endpoints.sedpSubReader->registerCallback(receiveCallbackSubscriber,
-                                                this);
-  }
+  m_endpoints.sedpSubReader->registerCallback(receiveCallbackSubscriber,
+                                              this);
+  return true;
 }
 
 void SEDPAgent::registerOnNewPublisherMatchedCallback(
@@ -150,6 +160,7 @@ void SEDPAgent::addUnmatchedRemoteReader(const TopicData &readerData)
 void SEDPAgent::removeUnmatchedEntitiesOfParticipant(
     const GuidPrefix_t &guidPrefix)
 {
+  Lock lock{m_mutex};
   auto isElementToRemove = [&](const TopicDataCompressed &topicData)
   {
     return topicData.endpointGuid.prefix == guidPrefix;
@@ -166,11 +177,13 @@ void SEDPAgent::removeUnmatchedEntitiesOfParticipant(
 
 uint32_t SEDPAgent::getNumRemoteUnmatchedReaders()
 {
+  Lock lock{m_mutex};
   return m_unmatchedRemoteReaders.getNumElements();
 }
 
 uint32_t SEDPAgent::getNumRemoteUnmatchedWriters()
 {
+  Lock lock{m_mutex};
   return m_unmatchedRemoteWriters.getNumElements();
 }
 
@@ -178,7 +191,7 @@ void SEDPAgent::onNewPublisher(const TopicData &writerData)
 {
   // TODO Is it okay to add Endpoint if the respective participant is unknown
   // participant?
-  if (!m_part->findRemoteParticipant(writerData.endpointGuid.prefix))
+  if (!m_part->hasRemoteParticipant(writerData.endpointGuid.prefix))
   {
     return;
   }
@@ -242,7 +255,7 @@ void SEDPAgent::onNewSubscriber(const ReaderCacheChange &change)
 
 void SEDPAgent::onNewSubscriber(const TopicData &readerData)
 {
-  if (!m_part->findRemoteParticipant(readerData.endpointGuid.prefix))
+  if (!m_part->hasRemoteParticipant(readerData.endpointGuid.prefix))
   {
     return;
   }
@@ -317,77 +330,209 @@ void SEDPAgent::tryMatchUnmatchedEndpoints()
   }
 }
 
-// writerが追加されたときに呼ばれ、EDPパケットで他ノードに通知する
-void SEDPAgent::addWriter(Writer &writer)
+bool SEDPAgent::projectLocalIp(uint32_t networkOrderIp)
 {
-  if (m_endpoints.sedpPubWriter == nullptr)
+  if (networkOrderIp == 0 || m_part == nullptr) return false;
+
+  std::array<StatefulWriter *, Config::NUM_WRITERS_PER_PARTICIPANT> pubWriters{};
+  std::array<StatefulWriter *, Config::NUM_READERS_PER_PARTICIPANT> subWriters{};
+  uint8_t pubCount = 0;
+  uint8_t subCount = 0;
   {
-    return;
-  }
-  EntityKind_t writerKind =
-      writer.m_attributes.endpointGuid.entityId.entityKind;
-  if (writerKind == EntityKind_t::BUILD_IN_WRITER_WITH_KEY ||
-      writerKind == EntityKind_t::BUILD_IN_WRITER_WITHOUT_KEY)
-  {
-    return; // No need to announce builtin endpoints
-  }
+    Lock lock{m_mutex};
+    auto &spdp = m_part->m_spdpAgent;
+    if (m_part->m_sedpAgent.m_part != m_part || !spdp.initialized ||
+        !m_endpoints.sedpPubWriter || !m_endpoints.sedpSubWriter ||
+        !m_endpoints.sedpPubWriter->isInitialized() ||
+        !m_endpoints.sedpSubWriter->isInitialized() ||
+        !m_endpoints.sedpPubReader || !m_endpoints.sedpSubReader ||
+        !m_endpoints.sedpPubReader->isInitialized() ||
+        !m_endpoints.sedpSubReader->isInitialized() ||
+        !spdp.m_buildInEndpoints.spdpWriter ||
+        !spdp.m_buildInEndpoints.spdpReader ||
+        !spdp.m_buildInEndpoints.spdpWriter->isInitialized() ||
+        !spdp.m_buildInEndpoints.spdpReader->isInitialized())
+      return false;
+    if (spdp.m_lastAppliedIp == networkOrderIp) return true;
 
-  Lock lock{m_mutex};
+    const auto snapshot = m_part->snapshotEndpoints();
+    if (snapshot.numWriters > snapshot.writers.size() ||
+        snapshot.numReaders > snapshot.readers.size())
+      return false;
 
-  // Check unmatched writers for this new reader
-  // writerなどの追加をおこなっている？
-  tryMatchUnmatchedEndpoints();
+    ip4_addr_t current{};
+    current.addr = networkOrderIp;
+    const std::array<uint8_t, 4> ip{{ip4_addr1(&current), ip4_addr2(&current),
+                                     ip4_addr3(&current), ip4_addr4(&current)}};
+    const FullLengthLocator locator = getUserUnicastLocator(m_part->m_participantId, ip);
+    std::array<PBufWrapper, Config::NUM_WRITERS_PER_PARTICIPANT> pubPayloads{};
+    std::array<PBufWrapper, Config::NUM_READERS_PER_PARTICIPANT> subPayloads{};
 
-  ucdrBuffer microbuffer;
-  ucdr_init_buffer(&microbuffer, m_buffer,
-                   sizeof(m_buffer) / sizeof(m_buffer[0]));
-  const uint16_t zero_options = 0;
+    for (uint8_t i = 0; i < snapshot.numWriters; ++i)
+    {
+      Writer *writer = snapshot.writers[i];
+      if (!writer || !writer->isInitialized()) return false;
+      const auto kind = writer->m_attributes.endpointGuid.entityId.entityKind;
+      if (kind == EntityKind_t::BUILD_IN_WRITER_WITH_KEY ||
+          kind == EntityKind_t::BUILD_IN_WRITER_WITHOUT_KEY) continue;
+      if ((kind != EntityKind_t::USER_DEFINED_WRITER_WITH_KEY &&
+           kind != EntityKind_t::USER_DEFINED_WRITER_WITHOUT_KEY) ||
+          pubCount >= Config::HISTORY_SIZE_STATEFUL)
+        return false;
+      if (!discovery_detail::prepareTopic(writer->m_attributes, locator,
+                                           pubPayloads[pubCount])) return false;
+      pubWriters[pubCount++] = m_endpoints.sedpPubWriter;
+    }
+    for (uint8_t i = 0; i < snapshot.numReaders; ++i)
+    {
+      Reader *reader = snapshot.readers[i];
+      if (!reader || !reader->isInitialized()) return false;
+      const auto kind = reader->m_attributes.endpointGuid.entityId.entityKind;
+      if (kind == EntityKind_t::BUILD_IN_READER_WITH_KEY ||
+          kind == EntityKind_t::BUILD_IN_READER_WITHOUT_KEY) continue;
+      if (kind != EntityKind_t::USER_DEFINED_READER_WITH_KEY &&
+          kind != EntityKind_t::USER_DEFINED_READER_WITHOUT_KEY)
+        return false;
+      if (subCount >= Config::HISTORY_SIZE_STATEFUL) return false;
+      if (!discovery_detail::prepareTopic(reader->m_attributes, locator,
+                                           subPayloads[subCount])) return false;
+      subWriters[subCount++] = m_endpoints.sedpSubWriter;
+    }
 
-  ucdr_serialize_array_uint8_t(&microbuffer,
-                               rtps::SMElement::SCHEME_PL_CDR_LE.data(),
-                               rtps::SMElement::SCHEME_PL_CDR_LE.size());
-  ucdr_serialize_uint16_t(&microbuffer, zero_options);
-  writer.m_attributes.serializeIntoUcdrBuffer(microbuffer); // ここでEDPパケットに送るwriterの情報を書き込んでいる？
-  m_endpoints.sedpPubWriter->newChange(ChangeKind_t::ALIVE, m_buffer,
-                                       ucdr_buffer_length(&microbuffer));
-#if SEDP_VERBOSE
-  SEDP_LOG("Added new change to sedpPubWriter.\n");
+    std::array<uint8_t, 400> announcement{};
+    DataSize_t announcementLength = 0;
+    PBufWrapper spdpPayload;
+    if (!spdp.prepareAnnouncement(ip, announcement, announcementLength,
+                                  spdpPayload)) return false;
+
+    // Everything fallible is complete. These private typed admissions are
+    // guaranteed moves into already validated fixed histories.
+#if defined(RTPS_T10_TEST_ACCESS)
+    extern void rtpsT10CommitAudit(int);
+    rtpsT10CommitAudit(1);
 #endif
+    for (uint8_t i = 0; i < pubCount; ++i)
+      pubWriters[i]->commitPreparedDiscoveryAlive(std::move(pubPayloads[i]));
+    for (uint8_t i = 0; i < subCount; ++i)
+      subWriters[i]->commitPreparedDiscoveryAlive(std::move(subPayloads[i]));
+    spdp.commitPreparedAnnouncement(std::move(spdpPayload), announcement,
+                                    announcementLength);
+    for (uint8_t i = 0; i < snapshot.numWriters; ++i)
+    {
+      Writer *writer = snapshot.writers[i];
+      const auto kind = writer->m_attributes.endpointGuid.entityId.entityKind;
+      if (kind == EntityKind_t::USER_DEFINED_WRITER_WITH_KEY ||
+          kind == EntityKind_t::USER_DEFINED_WRITER_WITHOUT_KEY)
+        writer->m_attributes.unicastLocator = locator;
+    }
+    for (uint8_t i = 0; i < snapshot.numReaders; ++i)
+    {
+      Reader *reader = snapshot.readers[i];
+      const auto kind = reader->m_attributes.endpointGuid.entityId.entityKind;
+      if (kind == EntityKind_t::USER_DEFINED_READER_WITH_KEY ||
+          kind == EntityKind_t::USER_DEFINED_READER_WITHOUT_KEY)
+        reader->m_attributes.unicastLocator = locator;
+    }
+    spdp.m_lastAppliedIp = networkOrderIp;
+#if defined(RTPS_T10_TEST_ACCESS)
+    rtpsT10CommitAudit(0);
+#endif
+  }
+
+  for (uint8_t i = 0; i < pubCount; ++i)
+    pubWriters[i]->notifyPreparedDiscovery();
+  for (uint8_t i = 0; i < subCount; ++i)
+    subWriters[i]->notifyPreparedDiscovery();
+  m_part->m_spdpAgent.notifyPreparedAnnouncement();
+  return true;
 }
 
-void SEDPAgent::addReader(Reader &reader)
+bool SEDPAgent::registerWriter(Writer &writer, bool initialIpValid,
+                              uint32_t initialIp)
 {
-  if (m_endpoints.sedpSubWriter == nullptr)
+  if (m_part == nullptr || !writer.isInitialized() ||
+      m_endpoints.sedpPubWriter == nullptr ||
+      !m_endpoints.sedpPubWriter->isInitialized()) return false;
+  const EntityKind_t kind = writer.m_attributes.endpointGuid.entityId.entityKind;
+  if (kind != EntityKind_t::USER_DEFINED_WRITER_WITH_KEY &&
+      kind != EntityKind_t::USER_DEFINED_WRITER_WITHOUT_KEY) return false;
+
+  PBufWrapper payload;
   {
-    return;
-  }
+    Lock lock{m_mutex};
+    const auto snapshot = m_part->snapshotEndpoints();
+    if (snapshot.numWriters >= snapshot.writers.size()) return false;
+    size_t userWriters = 0;
+    for (uint8_t i = 0; i < snapshot.numWriters; ++i)
+    {
+      if (snapshot.writers[i] == nullptr) return false;
+      const auto existingKind = snapshot.writers[i]->m_attributes.endpointGuid.entityId.entityKind;
+      if (existingKind == EntityKind_t::USER_DEFINED_WRITER_WITH_KEY ||
+          existingKind == EntityKind_t::USER_DEFINED_WRITER_WITHOUT_KEY) ++userWriters;
+    }
+    if (userWriters >= Config::HISTORY_SIZE_STATEFUL) return false;
+    const uint32_t selectedIp = m_part->m_spdpAgent.m_lastAppliedIp != 0
+                                    ? m_part->m_spdpAgent.m_lastAppliedIp
+                                    : (initialIpValid ? initialIp : 0);
+    if (selectedIp == 0) return false;
 
-  EntityKind_t readerKind =
-      reader.m_attributes.endpointGuid.entityId.entityKind;
-  if (readerKind == EntityKind_t::BUILD_IN_READER_WITH_KEY ||
-      readerKind == EntityKind_t::BUILD_IN_READER_WITHOUT_KEY)
+    ip4_addr_t address{};
+    address.addr = selectedIp;
+    const std::array<uint8_t, 4> bytes{{ip4_addr1(&address), ip4_addr2(&address),
+                                        ip4_addr3(&address), ip4_addr4(&address)}};
+    const auto locator = getUserUnicastLocator(m_part->m_participantId, bytes);
+    if (!discovery_detail::prepareTopic(writer.m_attributes, locator, payload)) return false;
+
+    m_endpoints.sedpPubWriter->commitPreparedDiscoveryAlive(std::move(payload));
+    writer.m_attributes.unicastLocator = locator;
+    m_part->publishRegisteredWriter(&writer);
+    tryMatchUnmatchedEndpoints();
+  }
+  m_endpoints.sedpPubWriter->notifyPreparedDiscovery();
+  return true;
+}
+
+bool SEDPAgent::registerReader(Reader &reader, bool initialIpValid,
+                               uint32_t initialIp)
+{
+  if (m_part == nullptr || !reader.isInitialized() ||
+      m_endpoints.sedpSubWriter == nullptr ||
+      !m_endpoints.sedpSubWriter->isInitialized()) return false;
+  const EntityKind_t kind = reader.m_attributes.endpointGuid.entityId.entityKind;
+  if (kind != EntityKind_t::USER_DEFINED_READER_WITH_KEY &&
+      kind != EntityKind_t::USER_DEFINED_READER_WITHOUT_KEY) return false;
+
+  PBufWrapper payload;
   {
-    return; // No need to announce builtin endpoints
+    Lock lock{m_mutex};
+    const auto snapshot = m_part->snapshotEndpoints();
+    if (snapshot.numReaders >= snapshot.readers.size()) return false;
+    size_t userReaders = 0;
+    for (uint8_t i = 0; i < snapshot.numReaders; ++i)
+    {
+      if (snapshot.readers[i] == nullptr) return false;
+      const auto existingKind = snapshot.readers[i]->m_attributes.endpointGuid.entityId.entityKind;
+      if (existingKind == EntityKind_t::USER_DEFINED_READER_WITH_KEY ||
+          existingKind == EntityKind_t::USER_DEFINED_READER_WITHOUT_KEY) ++userReaders;
+    }
+    if (userReaders >= Config::HISTORY_SIZE_STATEFUL) return false;
+    const uint32_t selectedIp = m_part->m_spdpAgent.m_lastAppliedIp != 0
+                                    ? m_part->m_spdpAgent.m_lastAppliedIp
+                                    : (initialIpValid ? initialIp : 0);
+    if (selectedIp == 0) return false;
+
+    ip4_addr_t address{};
+    address.addr = selectedIp;
+    const std::array<uint8_t, 4> bytes{{ip4_addr1(&address), ip4_addr2(&address),
+                                        ip4_addr3(&address), ip4_addr4(&address)}};
+    const auto locator = getUserUnicastLocator(m_part->m_participantId, bytes);
+    if (!discovery_detail::prepareTopic(reader.m_attributes, locator, payload)) return false;
+
+    m_endpoints.sedpSubWriter->commitPreparedDiscoveryAlive(std::move(payload));
+    reader.m_attributes.unicastLocator = locator;
+    m_part->publishRegisteredReader(&reader);
+    tryMatchUnmatchedEndpoints();
   }
-
-  Lock lock{m_mutex};
-
-  // Check unmatched writers for this new reader
-  tryMatchUnmatchedEndpoints();
-
-  ucdrBuffer microbuffer;
-  ucdr_init_buffer(&microbuffer, m_buffer,
-                   sizeof(m_buffer) / sizeof(m_buffer[0]));
-  const uint16_t zero_options = 0;
-
-  ucdr_serialize_array_uint8_t(&microbuffer,
-                               rtps::SMElement::SCHEME_PL_CDR_LE.data(),
-                               rtps::SMElement::SCHEME_PL_CDR_LE.size());
-  ucdr_serialize_uint16_t(&microbuffer, zero_options);
-  reader.m_attributes.serializeIntoUcdrBuffer(microbuffer); // ここでEDPパケットに送るreaderの情報を書き込んでいる？
-  m_endpoints.sedpSubWriter->newChange(ChangeKind_t::ALIVE, m_buffer,
-                                       ucdr_buffer_length(&microbuffer));
-#if SEDP_VERBOSE
-  SEDP_LOG("Added new change to sedpSubWriter.\n");
-#endif
+  m_endpoints.sedpSubWriter->notifyPreparedDiscovery();
+  return true;
 }

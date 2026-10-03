@@ -41,11 +41,13 @@ using rtps::StatelessReader;
 #endif
 
 void StatelessReader::init(const TopicData &attributes) {
-  m_attributes = attributes;
-  m_is_initialized_ = true;
+  m_is_initialized_ = false;
   if (sys_mutex_new(&m_mutex) != ERR_OK) {
     SLR_LOG("Failed to create mutex.\n");
+    return;
   }
+  m_attributes = attributes;
+  m_is_initialized_ = true;
 }
 
 void StatelessReader::newChange(const ReaderCacheChange &cacheChange) {

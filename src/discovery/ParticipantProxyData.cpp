@@ -87,7 +87,7 @@ bool ParticipantProxyData::readFromUcdrBuffer(ucdrBuffer &buffer,
                                      m_guid.entityId.entityKey.size());
       ucdr_deserialize_uint8_t(
           &buffer, reinterpret_cast<uint8_t *>(&m_guid.entityId.entityKind));
-      if (participant->findRemoteParticipant(m_guid.prefix)) {
+      if (participant->hasRemoteParticipant(m_guid.prefix)) {
         SPDP_LOG("stopping deserialization early, participant is known\n");
         return true;
       }

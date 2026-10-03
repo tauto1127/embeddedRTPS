@@ -200,6 +200,38 @@ void StatelessWriterT<NetworkDriver>::removeReaderOfParticipant(
 }
 
 template <class NetworkDriver>
+void StatelessWriterT<NetworkDriver>::replacePreparedDiscoveryAlive(
+    PBufWrapper &&payload) noexcept
+{
+  Lock lock{m_mutex};
+
+  // Retire all prior samples while the writer is locked. Their owned buffers
+  // are released here; the cache keeps only the newly committed SPDP sample.
+  m_history.removeUntilIncl(m_history.getSeqNumMax());
+
+  CacheChange change{};
+  change.kind = ChangeKind_t::ALIVE;
+  change.sequenceNumber = SEQUENCENUMBER_UNKNOWN;
+  change.data = std::move(payload);
+  change.serializerCallback = nullptr;
+  change.sizeToBeSerialized = 0;
+  change.serviceRespFlag = false;
+  change.identify = {};
+
+  const CacheChange *committed = m_history.addPreparedChange(std::move(change));
+  m_nextSequenceNumberToSend = committed->sequenceNumber;
+}
+
+template <class NetworkDriver>
+void StatelessWriterT<NetworkDriver>::notifyPreparedDiscovery() noexcept
+{
+  if (mp_threadPool != nullptr)
+  {
+    mp_threadPool->addWorkload(this);
+  }
+}
+
+template <class NetworkDriver>
 const rtps::CacheChange *StatelessWriterT<NetworkDriver>::newChangeIdentify(
     ChangeKind_t kind, const uint8_t *data, DataSize_t size, Sample_Indetify identify)
 {

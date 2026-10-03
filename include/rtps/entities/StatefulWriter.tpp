@@ -225,6 +225,39 @@ void StatefulWriterT<NetworkDriver>::removeReaderOfParticipant(
 }
 
 template <class NetworkDriver>
+void StatefulWriterT<NetworkDriver>::commitPreparedDiscoveryAlive(
+    PBufWrapper &&payload) noexcept
+{
+  Lock lock{m_mutex};
+
+  CacheChange change{};
+  change.kind = ChangeKind_t::ALIVE;
+  change.sequenceNumber = SEQUENCENUMBER_UNKNOWN;
+  change.data = std::move(payload);
+  change.serializerCallback = nullptr;
+  change.sizeToBeSerialized = 0;
+  change.serviceRespFlag = false;
+  change.identify = {};
+
+  m_history.addPreparedChange(std::move(change));
+
+  const SequenceNumber_t &newMin = m_history.getSeqNumMin();
+  if (m_nextSequenceNumberToSend < newMin)
+  {
+    m_nextSequenceNumberToSend = newMin;
+  }
+}
+
+template <class NetworkDriver>
+void StatefulWriterT<NetworkDriver>::notifyPreparedDiscovery() noexcept
+{
+  if (mp_threadPool != nullptr)
+  {
+    mp_threadPool->addWorkload(this);
+  }
+}
+
+template <class NetworkDriver>
 const rtps::CacheChange *StatefulWriterT<NetworkDriver>::newChangeIdentify(
     ChangeKind_t kind, const uint8_t *data, DataSize_t size, Sample_Indetify identify)
 {

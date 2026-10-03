@@ -61,11 +61,19 @@ bool Domain::completeInit()
     DOMAIN_LOG("Failed starting threads\n");
   }
 
-  for (auto i = 0; i < m_nextParticipantId; i++)
+  bool hasPublishedParticipant = false;
+  if (m_initComplete)
   {
-    m_participants[i].getSPDPAgent().start();
+    for (auto i = 0; i < m_nextParticipantId - PARTICIPANT_START_ID; i++)
+    {
+      if (m_participants[i].hasBuiltInEndpoints())
+      {
+        hasPublishedParticipant = true;
+        m_participants[i].getSPDPAgent().start();
+      }
+    }
   }
-  return m_initComplete;
+  return m_initComplete && hasPublishedParticipant;
 }
 
 void Domain::stop() { m_threadPool.stopThreads(); }
@@ -159,16 +167,42 @@ rtps::Participant *Domain::createParticipant()
   auto &entry = m_participants[nextSlot];
   entry.reuse(generateGuidPrefix(m_nextParticipantId), m_nextParticipantId);
   registerPort(entry);
-  createBuiltinWritersAndReaders(entry);
+  if (!createBuiltinWritersAndReaders(entry))
+  {
+    DOMAIN_LOG("Domain: Failed initializing builtin endpoints.\n");
+    // A partially initialized fixed-pool slot cannot be initialized again.
+    // Retire each endpoint object which successfully acquired resources.
+    m_numStatelessWriters +=
+        m_statelessWriters[m_numStatelessWriters].isInitialized() ? 1 : 0;
+    m_numStatelessReaders +=
+        m_statelessReaders[m_numStatelessReaders].isInitialized() ? 1 : 0;
+    const auto initializedStatefulWriters =
+        static_cast<uint8_t>(m_statefulWriters[m_numStatefulWriters].isInitialized()) +
+        static_cast<uint8_t>(m_statefulWriters[m_numStatefulWriters + 1].isInitialized());
+    const auto initializedStatefulReaders =
+        static_cast<uint8_t>(m_statefulReaders[m_numStatefulReaders].isInitialized()) +
+        static_cast<uint8_t>(m_statefulReaders[m_numStatefulReaders + 1].isInitialized());
+    m_numStatefulWriters += initializedStatefulWriters;
+    m_numStatefulReaders += initializedStatefulReaders;
+    ++m_nextParticipantId;
+    return nullptr;
+  }
   ++m_nextParticipantId;
   return &entry;
 }
 
-void Domain::createBuiltinWritersAndReaders(Participant &part)
+bool Domain::createBuiltinWritersAndReaders(Participant &part)
 {
+  if (m_numStatelessWriters >= m_statelessWriters.size() ||
+      m_numStatelessReaders >= m_statelessReaders.size() ||
+      m_numStatefulWriters + 2 > m_statefulWriters.size() ||
+      m_numStatefulReaders + 2 > m_statefulReaders.size())
+  {
+    return false;
+  }
   // SPDP
-  StatelessWriter &spdpWriter = m_statelessWriters[m_numStatelessWriters++];
-  StatelessReader &spdpReader = m_statelessReaders[m_numStatelessReaders++];
+  StatelessWriter &spdpWriter = m_statelessWriters[m_numStatelessWriters];
+  StatelessReader &spdpReader = m_statelessReaders[m_numStatelessReaders];
 
   TopicData spdpWriterAttributes;
   spdpWriterAttributes.topicName[0] = '\0';
@@ -180,8 +214,11 @@ void Domain::createBuiltinWritersAndReaders(Participant &part)
       ENTITYID_SPDP_BUILTIN_PARTICIPANT_WRITER;
   spdpWriterAttributes.unicastLocator = getBuiltInMulticastLocator();
 
-  spdpWriter.init(spdpWriterAttributes, TopicKind_t::WITH_KEY, &m_threadPool,
-                  m_transport);
+  if (!spdpWriter.init(spdpWriterAttributes, TopicKind_t::WITH_KEY,
+                       &m_threadPool, m_transport))
+  {
+    return false;
+  }
   spdpWriter.addNewMatchedReader(
       ReaderProxy{{part.m_guidPrefix, ENTITYID_SPDP_BUILTIN_PARTICIPANT_READER},
                   getBuiltInMulticastLocator()});
@@ -190,14 +227,26 @@ void Domain::createBuiltinWritersAndReaders(Participant &part)
   spdpReaderAttributes.endpointGuid = {
       part.m_guidPrefix, ENTITYID_SPDP_BUILTIN_PARTICIPANT_READER};
   spdpReader.init(spdpReaderAttributes);
+  if (!spdpReader.isInitialized())
+  {
+    return false;
+  }
 
   // SEDP
-  StatefulReader &sedpPubReader = m_statefulReaders[m_numStatefulReaders++];
-  StatefulReader &sedpSubReader = m_statefulReaders[m_numStatefulReaders++];
-  StatefulWriter &sedpPubWriter = m_statefulWriters[m_numStatefulWriters++];
-  StatefulWriter &sedpSubWriter = m_statefulWriters[m_numStatefulWriters++];
+  StatefulReader &sedpPubReader = m_statefulReaders[m_numStatefulReaders];
+  StatefulReader &sedpSubReader = m_statefulReaders[m_numStatefulReaders + 1];
+  StatefulWriter &sedpPubWriter = m_statefulWriters[m_numStatefulWriters];
+  StatefulWriter &sedpSubWriter = m_statefulWriters[m_numStatefulWriters + 1];
 
-  // Prepare attributes
+  // Prepare attributes from one safe current-IP copy; never seed a zero locator
+  // when the snapshot is unavailable.
+  std::array<uint8_t, 4> initialIp{};
+  if (!UdpDriver::getLocalIpAddress(initialIp) ||
+      (initialIp[0] == 0 && initialIp[1] == 0 &&
+       initialIp[2] == 0 && initialIp[3] == 0))
+  {
+    return false;
+  }
   TopicData sedpAttributes;
   sedpAttributes.topicName[0] = '\0';
   sedpAttributes.typeName[0] = '\0';
@@ -205,26 +254,40 @@ void Domain::createBuiltinWritersAndReaders(Participant &part)
   sedpAttributes.durabilityKind = DurabilityKind_t::TRANSIENT_LOCAL;
   sedpAttributes.endpointGuid.prefix = part.m_guidPrefix;
   sedpAttributes.unicastLocator =
-      getBuiltInUnicastLocator(part.m_participantId);
+      getBuiltInUnicastLocator(part.m_participantId, initialIp);
 
   // READER
   sedpAttributes.endpointGuid.entityId =
       ENTITYID_SEDP_BUILTIN_PUBLICATIONS_READER;
   sedpPubReader.init(sedpAttributes, m_transport);
+  if (!sedpPubReader.isInitialized())
+  {
+    return false;
+  }
   sedpAttributes.endpointGuid.entityId =
       ENTITYID_SEDP_BUILTIN_SUBSCRIPTIONS_READER;
   sedpSubReader.init(sedpAttributes, m_transport);
+  if (!sedpSubReader.isInitialized())
+  {
+    return false;
+  }
 
   // WRITER
   sedpAttributes.endpointGuid.entityId =
       ENTITYID_SEDP_BUILTIN_PUBLICATIONS_WRITER;
-  sedpPubWriter.init(sedpAttributes, TopicKind_t::NO_KEY, &m_threadPool,
-                     m_transport);
+  if (!sedpPubWriter.init(sedpAttributes, TopicKind_t::NO_KEY,
+                          &m_threadPool, m_transport))
+  {
+    return false;
+  }
 
   sedpAttributes.endpointGuid.entityId =
       ENTITYID_SEDP_BUILTIN_SUBSCRIPTIONS_WRITER;
-  sedpSubWriter.init(sedpAttributes, TopicKind_t::NO_KEY, &m_threadPool,
-                     m_transport);
+  if (!sedpSubWriter.init(sedpAttributes, TopicKind_t::NO_KEY,
+                          &m_threadPool, m_transport))
+  {
+    return false;
+  }
 
   // COLLECT
   BuiltInEndpoints endpoints{};
@@ -235,7 +298,15 @@ void Domain::createBuiltinWritersAndReaders(Participant &part)
   endpoints.sedpPubWriter = &sedpPubWriter;
   endpoints.sedpSubWriter = &sedpSubWriter;
 
-  part.addBuiltInEndpoints(endpoints);
+  if (!part.addBuiltInEndpoints(endpoints))
+  {
+    return false;
+  }
+  ++m_numStatelessWriters;
+  ++m_numStatelessReaders;
+  m_numStatefulReaders += 2;
+  m_numStatefulWriters += 2;
+  return true;
 }
 
 void Domain::registerPort(const Participant &part)
@@ -395,7 +466,13 @@ rtps::Writer *Domain::createWriter(Participant &part, const char *topicName,
   attributes.endpointGuid.entityId = {
       part.getNextUserEntityKey(),
       EntityKind_t::USER_DEFINED_WRITER_WITHOUT_KEY};
-  attributes.unicastLocator = getUserUnicastLocator(part.m_participantId);
+  std::array<uint8_t, 4> currentIp{};
+  if (!UdpDriver::getLocalIpAddress(currentIp) ||
+      (currentIp[0] == 0 && currentIp[1] == 0 &&
+       currentIp[2] == 0 && currentIp[3] == 0))
+    return nullptr;
+  attributes.unicastLocator =
+      getUserUnicastLocator(part.m_participantId, currentIp);
   attributes.durabilityKind = DurabilityKind_t::TRANSIENT_LOCAL;
 
   DOMAIN_LOG("Creating writer[%s, %s]\n", topicName, typeName);
@@ -404,23 +481,23 @@ rtps::Writer *Domain::createWriter(Participant &part, const char *topicName,
   {
     attributes.reliabilityKind = ReliabilityKind_t::RELIABLE;
 
-    StatefulWriter &writer = m_statefulWriters[m_numStatefulWriters++];
-    writer.init(attributes, TopicKind_t::NO_KEY, &m_threadPool, m_transport,
-                enforceUnicast);
-
-    part.addWriter(&writer);
-    return &writer;
+    StatefulWriter &writer = m_statefulWriters[m_numStatefulWriters];
+    if (!writer.init(attributes, TopicKind_t::NO_KEY, &m_threadPool, m_transport,
+                     enforceUnicast))
+      return nullptr;
+    ++m_numStatefulWriters;
+    return part.addWriter(&writer) ? &writer : nullptr;
   }
   else
   {
     attributes.reliabilityKind = ReliabilityKind_t::BEST_EFFORT;
 
-    StatelessWriter &writer = m_statelessWriters[m_numStatelessWriters++];
-    writer.init(attributes, TopicKind_t::NO_KEY, &m_threadPool, m_transport,
-                enforceUnicast);
-
-    part.addWriter(&writer);
-    return &writer;
+    StatelessWriter &writer = m_statelessWriters[m_numStatelessWriters];
+    if (!writer.init(attributes, TopicKind_t::NO_KEY, &m_threadPool, m_transport,
+                     enforceUnicast))
+      return nullptr;
+    ++m_numStatelessWriters;
+    return part.addWriter(&writer) ? &writer : nullptr;
   }
 }
 
@@ -452,7 +529,13 @@ rtps::Reader *Domain::createReader(Participant &part, const char *topicName,
   attributes.endpointGuid.entityId = {
       part.getNextUserEntityKey(),
       EntityKind_t::USER_DEFINED_READER_WITHOUT_KEY};
-  attributes.unicastLocator = getUserUnicastLocator(part.m_participantId);
+  std::array<uint8_t, 4> currentIp{};
+  if (!UdpDriver::getLocalIpAddress(currentIp) ||
+      (currentIp[0] == 0 && currentIp[1] == 0 &&
+       currentIp[2] == 0 && currentIp[3] == 0))
+    return nullptr;
+  attributes.unicastLocator =
+      getUserUnicastLocator(part.m_participantId, currentIp);
   if (!isZeroAddress(mcastaddress))
   {
     if (ip4_addr_ismulticast(&mcastaddress))
@@ -486,14 +569,11 @@ rtps::Reader *Domain::createReader(Participant &part, const char *topicName,
 
     attributes.reliabilityKind = ReliabilityKind_t::RELIABLE;
 
-    StatefulReader &reader = m_statefulReaders[m_numStatefulReaders++];
+    StatefulReader &reader = m_statefulReaders[m_numStatefulReaders];
     reader.init(attributes, m_transport);
-
-    if (!part.addReader(&reader))
-    {
-      return nullptr;
-    }
-    return &reader;
+    if (!reader.isInitialized()) return nullptr;
+    ++m_numStatefulReaders;
+    return part.addReader(&reader) ? &reader : nullptr;
   }
   else
   {
@@ -504,14 +584,11 @@ rtps::Reader *Domain::createReader(Participant &part, const char *topicName,
 
     attributes.reliabilityKind = ReliabilityKind_t::BEST_EFFORT;
 
-    StatelessReader &reader = m_statelessReaders[m_numStatelessReaders++];
+    StatelessReader &reader = m_statelessReaders[m_numStatelessReaders];
     reader.init(attributes);
-
-    if (!part.addReader(&reader))
-    {
-      return nullptr;
-    }
-    return &reader;
+    if (!reader.isInitialized()) return nullptr;
+    ++m_numStatelessReaders;
+    return part.addReader(&reader) ? &reader : nullptr;
   }
 }
 
@@ -522,9 +599,13 @@ rtps::GuidPrefix_t Domain::generateGuidPrefix(ParticipantId_t id) const
   srand(time(nullptr));
 #else
   unsigned int seed = (int)xTaskGetTickCount();
-  if (netif_default != nullptr)
+  std::array<uint8_t, 4> ip{};
+  if (UdpDriver::getLocalIpAddress(ip))
   {
-    seed ^= netif_default->ip_addr.addr;
+    seed ^= (static_cast<unsigned int>(ip[0]) << 24) |
+            (static_cast<unsigned int>(ip[1]) << 16) |
+            (static_cast<unsigned int>(ip[2]) << 8) |
+            static_cast<unsigned int>(ip[3]);
   }
   srand(seed);
 #endif

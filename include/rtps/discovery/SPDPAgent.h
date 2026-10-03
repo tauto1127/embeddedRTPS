@@ -30,6 +30,7 @@ Author: i11 - Embedded Software, RWTH Aachen University
 #include "rtps/config.h"
 #include "rtps/discovery/BuiltInEndpoints.h"
 #include "rtps/discovery/ParticipantProxyData.h"
+#include "rtps/storages/PBufWrapper.h"
 #include "ucdr/microcdr.h"
 
 #if SPDP_VERBOSE && RTPS_GLOBAL_VERBOSE
@@ -56,11 +57,16 @@ namespace rtps
   {
   public:
     ~SPDPAgent();
-    void init(Participant &participant, BuiltInEndpoints &endpoints);
+    bool init(Participant &participant, BuiltInEndpoints &endpoints);
     void start();
     void stop();
 
   private:
+#if defined(RTPS_T10_TEST_ACCESS)
+    friend struct T10aHarness;
+#endif
+    friend class SEDPAgent;
+    uint32_t m_lastAppliedIp = 0;
     Participant *mp_participant = nullptr;
     BuiltInEndpoints m_buildInEndpoints;
     bool m_running = false;
@@ -82,9 +88,18 @@ namespace rtps
     bool addProxiesForBuiltInEndpoints();
 
     void addInlineQos();
-    void addParticipantParameters();
+    bool serializeParticipantParameters(ucdrBuffer &output,
+        const std::array<uint8_t, 4> &ip) const;
     void endCurrentList();
     bool refreshLocalIp();
+    bool prepareAnnouncement(const std::array<uint8_t, 4> &ip,
+                             std::array<uint8_t, 400> &bytes,
+                             DataSize_t &length,
+                             PBufWrapper &payload) const;
+    void commitPreparedAnnouncement(PBufWrapper &&payload,
+                                    const std::array<uint8_t, 400> &bytes,
+                                    DataSize_t length) noexcept;
+    void notifyPreparedAnnouncement() noexcept;
 
     static void runBroadcast(void *args);
   };

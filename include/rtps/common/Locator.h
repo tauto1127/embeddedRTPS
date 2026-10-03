@@ -28,8 +28,6 @@ Author: i11 - Embedded Software, RWTH Aachen University
 #include "rtps/communication/UdpDriver.h"
 #include "rtps/utils/udpUtils.h"
 #include "ucdr/microcdr.h"
-#include "lwip/netif.h"
-
 #include <array>
 
 namespace rtps {
@@ -108,20 +106,21 @@ struct FullLengthLocator {
 
 } __attribute__((packed));
 
-inline std::array<uint8_t, 4> getLocalIpAddress() {
-  if (netif_default == nullptr) {
-    return {0, 0, 0, 0};
-  }
-  const ip4_addr_t &address = netif_default->ip_addr;
-  return {ip4_addr1(&address), ip4_addr2(&address), ip4_addr3(&address),
-          ip4_addr4(&address)};
+inline bool getLocalIpAddress(std::array<uint8_t, 4> &address) {
+  return UdpDriver::getLocalIpAddress(address);
+}
+
+inline FullLengthLocator getBuiltInUnicastLocator(
+    ParticipantId_t participantId, const std::array<uint8_t, 4> &ip) {
+  return FullLengthLocator::createUDPv4Locator(
+      ip[0], ip[1], ip[2], ip[3], getBuiltInUnicastPort(participantId));
 }
 
 inline FullLengthLocator
 getBuiltInUnicastLocator(ParticipantId_t participantId) {
-  const auto ip = getLocalIpAddress();
-  return FullLengthLocator::createUDPv4Locator(
-      ip[0], ip[1], ip[2], ip[3], getBuiltInUnicastPort(participantId));
+  std::array<uint8_t, 4> address{};
+  if (!getLocalIpAddress(address)) return {};
+  return getBuiltInUnicastLocator(participantId, address);
 }
 
 inline FullLengthLocator getBuiltInMulticastLocator() {
@@ -129,16 +128,23 @@ inline FullLengthLocator getBuiltInMulticastLocator() {
                                                getBuiltInMulticastPort());
 }
 
-inline FullLengthLocator getUserUnicastLocator(ParticipantId_t participantId) {
-  const auto ip = getLocalIpAddress();
+inline FullLengthLocator getUserUnicastLocator(
+    ParticipantId_t participantId, const std::array<uint8_t, 4> &ip) {
   return FullLengthLocator::createUDPv4Locator(
       ip[0], ip[1], ip[2], ip[3], getUserUnicastPort(participantId));
+}
+
+inline FullLengthLocator getUserUnicastLocator(ParticipantId_t participantId) {
+  std::array<uint8_t, 4> address{};
+  if (!getLocalIpAddress(address)) return {};
+  return getUserUnicastLocator(participantId, address);
 }
 
 inline FullLengthLocator
 getUserMulticastLocator() { // this would be a unicastaddress, as
                             // defined in config
-  const auto ip = getLocalIpAddress();
+  std::array<uint8_t, 4> ip{};
+  if (!getLocalIpAddress(ip)) return {};
   return FullLengthLocator::createUDPv4Locator(
       ip[0], ip[1], ip[2], ip[3], getUserMulticastPort());
 }

@@ -25,14 +25,17 @@ Author: i11 - Embedded Software, RWTH Aachen University
 #include "rtps/discovery/SPDPAgent.h"
 #include "lwip/sys.h"
 #include "rtps/discovery/ParticipantProxyData.h"
+#include "rtps/discovery/PreparedDiscovery.h"
 #include "rtps/entities/Participant.h"
+#include "rtps/communication/UdpDriver.h"
 #include "rtps/entities/Reader.h"
 #include "rtps/entities/Writer.h"
 #include "rtps/messages/MessageTypes.h"
 #include "rtps/utils/Log.h"
 #include "rtps/utils/udpUtils.h"
-#include "rtps/communication/TcpipCoreLock.h"
 #include "netif_wasm_add.h"
+#include <cstring>
+#include <utility>
 
 using rtps::SPDPAgent;
 using rtps::SMElement::BuildInEndpointSet;
@@ -46,13 +49,31 @@ SPDPAgent::~SPDPAgent()
   }
 }
 
-void SPDPAgent::init(Participant &participant, BuiltInEndpoints &endpoints)
+bool SPDPAgent::init(Participant &participant, BuiltInEndpoints &endpoints)
 {
+  if (initialized || endpoints.spdpWriter == nullptr ||
+      endpoints.spdpReader == nullptr || endpoints.sedpPubWriter == nullptr ||
+      endpoints.sedpPubReader == nullptr || endpoints.sedpSubWriter == nullptr ||
+      endpoints.sedpSubReader == nullptr)
+  {
+    return false;
+  }
   if (sys_mutex_new(&m_mutex) != ERR_OK)
   {
     SPDP_LOG("Could not alloc mutex");
-    return;
+    return false;
   }
+  std::array<uint8_t, 4> bytes{};
+  if (!UdpDriver::getLocalIpAddress(bytes) ||
+      (bytes[0] == 0 && bytes[1] == 0 && bytes[2] == 0 && bytes[3] == 0))
+  {
+    sys_mutex_free(&m_mutex);
+    return false;
+  }
+  ip4_addr_t current{};
+  IP4_ADDR(&current, bytes[0], bytes[1], bytes[2], bytes[3]);
+  const std::array<uint8_t, 4> ip{{ip4_addr1(&current), ip4_addr2(&current),
+                                   ip4_addr3(&current), ip4_addr4(&current)}};
   mp_participant = &participant;
   m_buildInEndpoints = endpoints;
   m_buildInEndpoints.spdpReader->registerCallback(receiveCallback, this);
@@ -60,13 +81,19 @@ void SPDPAgent::init(Participant &participant, BuiltInEndpoints &endpoints)
   ucdr_init_buffer(&m_microbuffer, m_outputBuffer.data(),
                    m_outputBuffer.size());
   // addInlineQos();
-  addParticipantParameters();
+  if (!serializeParticipantParameters(m_microbuffer, ip))
+  {
+    sys_mutex_free(&m_mutex);
+    return false;
+  }
   initialized = true;
+  return true;
 }
 
 void SPDPAgent::start()
 {
-  if (m_running)
+  if (m_running || !initialized || mp_participant == nullptr ||
+      !mp_participant->hasBuiltInEndpoints())
   {
     return;
   }
@@ -79,41 +106,66 @@ void SPDPAgent::stop() { m_running = false; }
 
 bool SPDPAgent::refreshLocalIp()
 {
-  int result;
-  {
-    TcpipCoreLock lock;
-    result = netif_wasm_refresh();
-  }
-  const int pending = netif_wasm_take_ip_changed();
-  if (result < 0) {
-    SPDP_LOG("Could not refresh local IP address\n");
-    return false;
-  }
-  if (result == 0 && pending == 0) {
-    return false;
-  }
+  int refreshResult = NETIF_WASM_REFRESH_UNCHANGED;
+  netif_wasm_ip_snapshot_t snapshot{};
+#if defined(__wasi__)
+  refreshResult = netif_wasm_refresh();
+  if (refreshResult == NETIF_WASM_REFRESH_BUSY) return false;
+  // FAILED may still use the last coherent valid snapshot, never fabricated IP.
+  if (netif_wasm_get_ip_snapshot(&snapshot) != 0) return false;
+#else
+  std::array<uint8_t, 4> bytes{};
+  if (!UdpDriver::getLocalIpAddress(bytes)) return false;
+  ip4_addr_t current{};
+  IP4_ADDR(&current, bytes[0], bytes[1], bytes[2], bytes[3]);
+  snapshot.ip_addr = current.addr;
+  snapshot.valid = 1;
+#endif
+  if (!snapshot.valid || snapshot.ip_addr == 0) return false;
+  if (refreshResult == NETIF_WASM_REFRESH_FAILED)
+    SPDP_LOG("Could not refresh local IP; projecting last valid snapshot\n");
+  return mp_participant->m_sedpAgent.projectLocalIp(snapshot.ip_addr);
+}
 
-  mp_participant->refreshLocalLocators();
+bool SPDPAgent::prepareAnnouncement(const std::array<uint8_t, 4> &ip,
+                                    std::array<uint8_t, 400> &bytes,
+                                    DataSize_t &length,
+                                    PBufWrapper &payload) const
+{
+  ucdrBuffer temporary{};
+  ucdr_init_buffer(&temporary, bytes.data(), bytes.size());
+  if (!serializeParticipantParameters(temporary, ip) ||
+      ucdr_buffer_has_error(&temporary)) return false;
+  const uint32_t serializedLength = ucdr_buffer_length(&temporary);
+  if (serializedLength == 0 || serializedLength > bytes.size() ||
+      serializedLength > UINT16_MAX) return false;
+  length = static_cast<DataSize_t>(serializedLength);
+  return discovery_detail::preparePayload(bytes.data(), length, payload);
+}
 
-  /* Rebuild the participant data so the next announcement carries the new
-   * unicast locator. The writer copies the buffer in newChange(). */
-  ucdr_init_buffer(&m_microbuffer, m_outputBuffer.data(),
-                   m_outputBuffer.size());
-  addParticipantParameters();
-  SPDP_LOG("Rebuilt participant announcement after local IP change\n");
-  return true;
+void SPDPAgent::commitPreparedAnnouncement(
+    PBufWrapper &&payload, const std::array<uint8_t, 400> &bytes,
+    DataSize_t length) noexcept
+{
+  m_buildInEndpoints.spdpWriter->replacePreparedDiscoveryAlive(
+      std::move(payload));
+  std::memcpy(m_outputBuffer.data(), bytes.data(), m_outputBuffer.size());
+  ucdr_init_buffer_offset(&m_microbuffer, m_outputBuffer.data(),
+                          m_outputBuffer.size(), length);
+}
+
+void SPDPAgent::notifyPreparedAnnouncement() noexcept
+{
+  m_buildInEndpoints.spdpWriter->notifyPreparedDiscovery();
 }
 
 // mros::initから呼び出し　PDPパケットを送信？
 void SPDPAgent::runBroadcast(void *args)
 {
   SPDPAgent &agent = *static_cast<SPDPAgent *>(args);
-  auto announce = [&agent]() {
-    const DataSize_t size = ucdr_buffer_length(&agent.m_microbuffer);
-    agent.m_buildInEndpoints.spdpWriter->newChange(
-        ChangeKind_t::ALIVE, agent.m_microbuffer.init, size);
-  };
-  announce();
+  // Startup has applied-IP sentinel zero, so use the same atomic projection
+  // path as periodic refresh rather than admitting a second unchecked record.
+  agent.refreshLocalIp();
   while (agent.m_running)
   {
 #ifdef OS_IS_FREERTOS
@@ -121,9 +173,8 @@ void SPDPAgent::runBroadcast(void *args)
 #else
     sys_msleep(Config::SPDP_RESEND_PERIOD_MS);
 #endif
-    if (agent.refreshLocalIp()) {
-      announce();
-    }
+    agent.refreshLocalIp();
+    // The latest-only prepared history is the sole periodic announcement.
     agent.m_buildInEndpoints.spdpWriter->setAllChangesToUnsent();
     if (agent.m_cycleHB == Config::SPDP_CYCLECOUNT_HEARTBEAT)
     {
@@ -215,10 +266,10 @@ void SPDPAgent::processProxyData()
     return; // Our own packet
   }
 
-  const rtps::ParticipantProxyData *remote_part;
-  remote_part =
-      mp_participant->findRemoteParticipant(m_proxyDataBuffer.m_guid.prefix);
-  if (remote_part != nullptr)
+  ParticipantProxyData remoteSnapshot{};
+  const auto *remote_part = &remoteSnapshot;
+  if (mp_participant->copyRemoteParticipant(m_proxyDataBuffer.m_guid.prefix,
+                                          remoteSnapshot))
   {
     const auto locator_list_changed = [](const auto &old_list,
                                          const auto &new_list) {
@@ -367,8 +418,11 @@ void SPDPAgent::endCurrentList()
   ucdr_serialize_uint16_t(&m_microbuffer, 0);
 }
 
-void SPDPAgent::addParticipantParameters()
+bool SPDPAgent::serializeParticipantParameters(ucdrBuffer &output,
+    const std::array<uint8_t, 4> &ip) const
 {
+  // All writes below target the caller-owned buffer, never the live member.
+  auto &m_microbuffer = output;
   const uint16_t zero_options = 0;
   const uint16_t protocolVersionSize =
       sizeof(PROTOCOLVERSION.major) + sizeof(PROTOCOLVERSION.minor);
@@ -382,9 +436,9 @@ void SPDPAgent::addParticipantParameters()
   const uint16_t guidSize = sizeof(GuidPrefix_t::id) + entityIdSize;
 
   const FullLengthLocator userUniCastLocator =
-      getUserUnicastLocator(mp_participant->m_participantId);
+      getUserUnicastLocator(mp_participant->m_participantId, ip);
   const FullLengthLocator builtInUniCastLocator =
-      getBuiltInUnicastLocator(mp_participant->m_participantId);
+      getBuiltInUnicastLocator(mp_participant->m_participantId, ip);
   const FullLengthLocator builtInMultiCastLocator =
       getBuiltInMulticastLocator();
 
@@ -397,15 +451,13 @@ void SPDPAgent::addParticipantParameters()
   ucdr_serialize_uint16_t(&m_microbuffer, protocolVersionSize + 2);
   ucdr_serialize_uint8_t(&m_microbuffer, PROTOCOLVERSION.major);
   ucdr_serialize_uint8_t(&m_microbuffer, PROTOCOLVERSION.minor);
-  m_microbuffer.iterator += 2;      // padding
-  m_microbuffer.last_data_size = 4; // to 4 byte
+  ucdr_serialize_uint16_t(&m_microbuffer, 0); // checked sticky padding
 
   ucdr_serialize_uint16_t(&m_microbuffer, ParameterId::PID_VENDORID);
   ucdr_serialize_uint16_t(&m_microbuffer, vendorIdSize + 2);
   ucdr_serialize_array_uint8_t(&m_microbuffer,
                                Config::VENDOR_ID.vendorId.data(), vendorIdSize);
-  m_microbuffer.iterator += 2;      // padding
-  m_microbuffer.last_data_size = 4; // to 4 byte
+  ucdr_serialize_uint16_t(&m_microbuffer, 0); // checked sticky padding
 
   ucdr_serialize_uint16_t(&m_microbuffer,
                           ParameterId::PID_DEFAULT_UNICAST_LOCATOR);
@@ -459,7 +511,9 @@ void SPDPAgent::addParticipantParameters()
                           BuildInEndpointSet::DISC_BIE_SUBSCRIPTION_ANNOUNCER |
                           BuildInEndpointSet::DISC_BIE_SUBSCRIPTION_DETECTOR);
 
-  endCurrentList();
+  ucdr_serialize_uint16_t(&m_microbuffer, ParameterId::PID_SENTINEL);
+  ucdr_serialize_uint16_t(&m_microbuffer, 0);
+  return !ucdr_buffer_has_error(&m_microbuffer);
 }
 
 #undef SPDP_VERBOSE

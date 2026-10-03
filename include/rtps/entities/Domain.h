@@ -58,6 +58,9 @@ public:
                        const char *typeName, bool reliable);
 
 private:
+#if defined(RTPS_T10_TEST_ACCESS)
+  friend struct T10aHarness;
+#endif
   friend class SizeInspector;
   ThreadPool m_threadPool;
   UdpDriver m_transport;
@@ -78,7 +81,7 @@ private:
 
   void receiveCallback(const PacketInfo &packet);
   GuidPrefix_t generateGuidPrefix(ParticipantId_t id) const;
-  void createBuiltinWritersAndReaders(Participant &part);
+  bool createBuiltinWritersAndReaders(Participant &part);
   void registerPort(const Participant &part);
   void registerMulticastPort(FullLengthLocator mcastLocator);
   static void receiveJumppad(void *callee, const PacketInfo &packet);

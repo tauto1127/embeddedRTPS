@@ -195,7 +195,7 @@ bool TopicData::serializeIntoUcdrBuffer(ucdrBuffer &buffer) const
   ucdr_serialize_uint16_t(&buffer, ParameterId::PID_SENTINEL);
   ucdr_serialize_uint16_t(&buffer, 0);
 
-  return true;
+  return !ucdr_buffer_has_error(&buffer);
 }
 
 bool TopicDataCompressed::matchesTopicOf(const TopicData &other) const

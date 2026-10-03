@@ -48,6 +48,7 @@ public:
   bool joinMultiCastGroup(ip4_addr_t addr) const;
   void sendPacket(PacketInfo &info);
 
+  static bool getLocalIpAddress(std::array<uint8_t, 4> &address);
   static bool isSameSubnet(ip4_addr_t addr);
   static bool isMulticastAddress(ip4_addr_t addr);
 

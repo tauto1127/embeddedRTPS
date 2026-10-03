@@ -28,8 +28,15 @@ Author: i11 - Embedded Software, RWTH Aachen University
 #include "rtps/config.h"
 #include "rtps/storages/CacheChange.h"
 
+#include <type_traits>
+#include <utility>
+
 namespace rtps
 {
+  template <class NetworkDriver>
+  class StatefulWriterT;
+  template <class NetworkDriver>
+  class StatelessWriterT;
 
   /**
    * Simple version of a history cache. It sets consecutive sequence numbers
@@ -167,6 +174,25 @@ namespace rtps
     }
 
   private:
+    template <class NetworkDriver>
+    friend class StatefulWriterT;
+    template <class NetworkDriver>
+    friend class StatelessWriterT;
+
+    // Discovery callers must validate an owned ALIVE change with a null
+    // callback, initialized metadata, and an exact payload before this commit.
+    const CacheChange *addPreparedChange(CacheChange &&change) noexcept
+    {
+      static_assert(std::is_nothrow_move_assignable<CacheChange>::value,
+                    "Prepared history insertion must not fail while moving");
+      change.sequenceNumber = ++m_lastUsedSequenceNumber;
+
+      CacheChange *place = &m_buffer[m_head];
+      incrementHead();
+      *place = std::move(change);
+      return place;
+    }
+
     std::array<CacheChange, SIZE + 1> m_buffer{};
     uint16_t m_head = 0;
     uint16_t m_tail = 0;

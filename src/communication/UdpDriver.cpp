@@ -25,6 +25,9 @@ Author: i11 - Embedded Software, RWTH Aachen University
 #include "rtps/communication/UdpDriver.h"
 #include "rtps/communication/TcpipCoreLock.h"
 #include "rtps/utils/Lock.h"
+#if defined(__wasi__)
+#include "netif_wasm_add.h"
+#endif
 #include "rtps/utils/Log.h"
 
 #include <lwip/igmp.h>
@@ -82,9 +85,48 @@ UdpDriver::createUdpConnection(Ip4Port_t receivePort) {
   return &m_conns[m_numConns - 1];
 }
 
+bool UdpDriver::getLocalIpAddress(std::array<uint8_t, 4> &address) {
+  ip4_addr_t ip{};
+#if defined(__wasi__)
+  netif_wasm_ip_snapshot_t snapshot{};
+  if (netif_wasm_get_ip_snapshot(&snapshot) != 0 || !snapshot.valid) {
+    return false;
+  }
+  ip.addr = snapshot.ip_addr;
+#else
+  {
+    TcpipCoreLock lock;
+    if (netif_default == nullptr) {
+      return false;
+    }
+    ip = netif_default->ip_addr;
+  }
+#endif
+  address = {ip4_addr1(&ip), ip4_addr2(&ip), ip4_addr3(&ip), ip4_addr4(&ip)};
+  return true;
+}
+
 bool UdpDriver::isSameSubnet(ip4_addr_t addr) {
-  return (ip4_addr_netcmp(&addr, &(netif_default->ip_addr),
-                          &(netif_default->netmask)) != 0);
+  ip4_addr_t ip{};
+  ip4_addr_t mask{};
+#if defined(__wasi__)
+  netif_wasm_ip_snapshot_t snapshot{};
+  if (netif_wasm_get_ip_snapshot(&snapshot) != 0 || !snapshot.valid) {
+    return false;
+  }
+  ip.addr = snapshot.ip_addr;
+  mask.addr = snapshot.netmask;
+#else
+  {
+    TcpipCoreLock lock;
+    if (netif_default == nullptr) {
+      return false;
+    }
+    ip = netif_default->ip_addr;
+    mask = netif_default->netmask;
+  }
+#endif
+  return ip4_addr_netcmp(&addr, &ip, &mask) != 0;
 }
 
 bool UdpDriver::isMulticastAddress(ip4_addr_t addr) {

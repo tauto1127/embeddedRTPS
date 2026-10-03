@@ -33,6 +33,8 @@ Author: i11 - Embedded Software, RWTH Aachen University
 namespace rtps
 {
 
+  class SEDPAgent;
+
   template <class NetworkDriver>
   class StatefulWriterT final : public Writer
   {
@@ -58,6 +60,14 @@ namespace rtps
                       const GuidPrefix_t &sourceGuidPrefix) override;
 
   private:
+    friend class SEDPAgent;
+#if defined(RTPS_T10_TEST_ACCESS)
+    friend struct T10aHarness;
+#endif
+
+    void commitPreparedDiscoveryAlive(PBufWrapper &&payload) noexcept;
+    void notifyPreparedDiscovery() noexcept;
+
     sys_mutex_t m_mutex;
     ThreadPool *mp_threadPool = nullptr;
 

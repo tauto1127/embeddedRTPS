@@ -29,6 +29,8 @@ Author: i11 - Embedded Software, RWTH Aachen University
 #include "rtps/common/Locator.h"
 #include "rtps/messages/MessageReceiver.h"
 #include "rtps/utils/Log.h"
+#include "rtps/communication/UdpDriver.h"
+#include "netif_wasm_add.h"
 
 #if PARTICIPANT_VERBOSE && RTPS_GLOBAL_VERBOSE
 #define PARTICIPANT_LOG(...)  \
@@ -82,6 +84,7 @@ bool Participant::isValid()
 
 std::array<uint8_t, 3> Participant::getNextUserEntityKey()
 {
+  Lock lock{m_mutex};
   const auto result = m_nextUserEntityId;
 
   ++m_nextUserEntityId[2];
@@ -120,83 +123,112 @@ bool Participant::registerOnNewSubscriberMatchedCallback(
   return true;
 }
 // m_writersの配列にポインターを追加して、EDPを動作させてそう
-rtps::Writer *Participant::addWriter(Writer *pWriter)
+rtps::Participant::EndpointSnapshot Participant::snapshotEndpoints() const
 {
-  if (pWriter != nullptr && m_numWriters != m_writers.size())
-  {
-    // m_writersの配列にポインターがさすwriterの情報を取得  topicNameとtype, reliabilityKindを表示
-    PARTICIPANT_LOG("Adding writer topic_name:%s | type_name:%s\n ", pWriter->m_attributes.topicName, pWriter->m_attributes.typeName);
-
-    m_writers[m_numWriters++] = pWriter;
-    if (m_hasBuilInEndpoints)
-    {
-      m_sedpAgent.addWriter(*pWriter); // EDPを動作させてそう
-    }
-    return pWriter;
-  }
-  else
-  {
-    // 失敗した場合
-    PARTICIPANT_LOG("fail to Adding writer topic_name:%s | type_name:%s\n ", pWriter->m_attributes.topicName, pWriter->m_attributes.typeName);
-    return nullptr;
-  }
+  Lock lock{m_mutex};
+  EndpointSnapshot result;
+  result.writers = m_writers;
+  result.readers = m_readers;
+  result.numWriters = m_numWriters;
+  result.numReaders = m_numReaders;
+  return result;
 }
 
-bool Participant::isWritersFull() { return m_numWriters == m_writers.size(); }
-
-rtps::Reader *Participant::addReader(Reader *pReader)
+void Participant::publishRegisteredWriter(Writer *writer)
 {
-  if (pReader != nullptr && m_numReaders != m_readers.size())
-  {
-    PARTICIPANT_LOG("Adding reader topic_name:%s | type_name:%s\n ", pReader->m_attributes.topicName, pReader->m_attributes.typeName);
-    m_readers[m_numReaders++] = pReader;
-    if (m_hasBuilInEndpoints)
-    {
-      m_sedpAgent.addReader(*pReader);
-    }
-    return pReader;
-  }
-  else
-  {
-    return nullptr;
-  }
+  Lock lock{m_mutex};
+  // Capacity is checked before SEDP admission; app creation is serialized.
+  m_writers[m_numWriters++] = writer;
 }
 
-bool Participant::isReadersFull() { return m_numReaders == m_readers.size(); }
+rtps::Writer *Participant::addWriter(Writer *writer)
+{
+  if (writer == nullptr || !m_hasBuilInEndpoints || !writer->isInitialized())
+    return nullptr;
+  netif_wasm_ip_snapshot_t snapshot{};
+#if defined(__wasi__)
+  const bool initialIpValid = netif_wasm_get_ip_snapshot(&snapshot) == 0 &&
+                              snapshot.valid && snapshot.ip_addr != 0;
+#else
+  std::array<uint8_t, 4> address{};
+  ip4_addr_t current{};
+  const bool initialIpValid = UdpDriver::getLocalIpAddress(address);
+  if (initialIpValid)
+  {
+    IP4_ADDR(&current, address[0], address[1], address[2], address[3]);
+    snapshot.ip_addr = current.addr;
+    snapshot.valid = 1;
+  }
+#endif
+  return m_sedpAgent.registerWriter(*writer, initialIpValid,
+                                    snapshot.ip_addr) ? writer : nullptr;
+}
+
+bool Participant::isWritersFull()
+{
+  Lock lock{m_mutex};
+  return m_numWriters == m_writers.size();
+}
+
+void Participant::publishRegisteredReader(Reader *reader)
+{
+  Lock lock{m_mutex};
+  // Capacity is checked before SEDP admission; app creation is serialized.
+  m_readers[m_numReaders++] = reader;
+}
+
+rtps::Reader *Participant::addReader(Reader *reader)
+{
+  if (reader == nullptr || !m_hasBuilInEndpoints || !reader->isInitialized())
+    return nullptr;
+  netif_wasm_ip_snapshot_t snapshot{};
+#if defined(__wasi__)
+  const bool initialIpValid = netif_wasm_get_ip_snapshot(&snapshot) == 0 &&
+                              snapshot.valid && snapshot.ip_addr != 0;
+#else
+  std::array<uint8_t, 4> address{};
+  ip4_addr_t current{};
+  const bool initialIpValid = UdpDriver::getLocalIpAddress(address);
+  if (initialIpValid)
+  {
+    IP4_ADDR(&current, address[0], address[1], address[2], address[3]);
+    snapshot.ip_addr = current.addr;
+    snapshot.valid = 1;
+  }
+#endif
+  return m_sedpAgent.registerReader(*reader, initialIpValid,
+                                    snapshot.ip_addr) ? reader : nullptr;
+}
+
+bool Participant::isReadersFull()
+{
+  Lock lock{m_mutex};
+  return m_numReaders == m_readers.size();
+}
 
 rtps::Writer *Participant::getWriter(EntityId_t id) const
 {
-  for (uint8_t i = 0; i < m_numWriters; ++i)
-  {
-    if (m_writers[i]->m_attributes.endpointGuid.entityId == id)
-    {
-      return m_writers[i];
-    }
-  }
+  const auto snapshot = snapshotEndpoints();
+  for (uint8_t i = 0; i < snapshot.numWriters; ++i)
+    if (snapshot.writers[i]->m_attributes.endpointGuid.entityId == id)
+      return snapshot.writers[i];
   return nullptr;
 }
 
 rtps::Reader *Participant::getReader(EntityId_t id) const
 {
-  for (uint8_t i = 0; i < m_numReaders; ++i)
-  {
-    if (m_readers[i]->m_attributes.endpointGuid.entityId == id)
-    {
-      return m_readers[i];
-    }
-  }
+  const auto snapshot = snapshotEndpoints();
+  for (uint8_t i = 0; i < snapshot.numReaders; ++i)
+    if (snapshot.readers[i]->m_attributes.endpointGuid.entityId == id)
+      return snapshot.readers[i];
   return nullptr;
 }
 
 rtps::Reader *Participant::getReaderByWriterId(const Guid_t &guid) const
 {
-  for (uint8_t i = 0; i < m_numReaders; ++i)
-  {
-    if (m_readers[i]->knowWriterId(guid))
-    {
-      return m_readers[i];
-    }
-  }
+  const auto snapshot = snapshotEndpoints();
+  for (uint8_t i = 0; i < snapshot.numReaders; ++i)
+    if (snapshot.readers[i]->knowWriterId(guid)) return snapshot.readers[i];
   return nullptr;
 }
 
@@ -207,18 +239,14 @@ Participant::getMatchingWriter(const TopicData &readerTopicData) const
   // readerTopicDataのtype_nameとtopic_nameを表示
   PARTICIPANT_LOG("[getMatchingWriter] Matching writer topic_name:%s | type_name:%s | reliabilityKind:%d\n ", readerTopicData.topicName, readerTopicData.typeName, readerTopicData.reliabilityKind);
 
-  for (uint8_t i = 0; i < m_numWriters; ++i)
+  const auto snapshot = snapshotEndpoints();
+  for (uint8_t i = 0; i < snapshot.numWriters; ++i)
   {
-    // マッチング回数を比較
-    PARTICIPANT_LOG("[getMatchingWriter] Matching writer [num=%d] topic_name:%s | type_name:%s | reliabilityKind:%d \n ", i, m_writers[i]->m_attributes.topicName, m_writers[i]->m_attributes.typeName, m_writers[i]->m_attributes.reliabilityKind);
-
-    if (m_writers[i]->m_attributes.matchesTopicOf(readerTopicData) &&
+    auto *writer = snapshot.writers[i];
+    if (writer->m_attributes.matchesTopicOf(readerTopicData) &&
         (readerTopicData.reliabilityKind == ReliabilityKind_t::BEST_EFFORT ||
-         m_writers[i]->m_attributes.reliabilityKind ==
-             ReliabilityKind_t::RELIABLE))
-    {
-      return m_writers[i];
-    }
+         writer->m_attributes.reliabilityKind == ReliabilityKind_t::RELIABLE))
+      return writer;
   }
   return nullptr;
 }
@@ -227,15 +255,14 @@ Participant::getMatchingWriter(const TopicData &readerTopicData) const
 rtps::Reader *
 Participant::getMatchingReader(const TopicData &writerTopicData) const
 {
-  for (uint8_t i = 0; i < m_numReaders; ++i)
+  const auto snapshot = snapshotEndpoints();
+  for (uint8_t i = 0; i < snapshot.numReaders; ++i)
   {
-    if (m_readers[i]->m_attributes.matchesTopicOf(writerTopicData) &&
+    auto *reader = snapshot.readers[i];
+    if (reader->m_attributes.matchesTopicOf(writerTopicData) &&
         (writerTopicData.reliabilityKind == ReliabilityKind_t::RELIABLE ||
-         m_readers[i]->m_attributes.reliabilityKind ==
-             ReliabilityKind_t::BEST_EFFORT))
-    {
-      return m_readers[i];
-    }
+         reader->m_attributes.reliabilityKind == ReliabilityKind_t::BEST_EFFORT))
+      return reader;
   }
   return nullptr;
 }
@@ -244,15 +271,14 @@ Participant::getMatchingReader(const TopicData &writerTopicData) const
 rtps::Writer *Participant::getMatchingWriter(
     const TopicDataCompressed &readerTopicData) const
 {
-  for (uint8_t i = 0; i < m_numWriters; ++i)
+  const auto snapshot = snapshotEndpoints();
+  for (uint8_t i = 0; i < snapshot.numWriters; ++i)
   {
-    if (readerTopicData.matchesTopicOf(m_writers[i]->m_attributes) &&
+    auto *writer = snapshot.writers[i];
+    if (readerTopicData.matchesTopicOf(writer->m_attributes) &&
         (readerTopicData.reliabilityKind == ReliabilityKind_t::BEST_EFFORT ||
-         m_writers[i]->m_attributes.reliabilityKind ==
-             ReliabilityKind_t::RELIABLE))
-    {
-      return m_writers[i];
-    }
+         writer->m_attributes.reliabilityKind == ReliabilityKind_t::RELIABLE))
+      return writer;
   }
   return nullptr;
 }
@@ -260,15 +286,14 @@ rtps::Writer *Participant::getMatchingWriter(
 rtps::Reader *Participant::getMatchingReader(
     const TopicDataCompressed &writerTopicData) const
 {
-  for (uint8_t i = 0; i < m_numReaders; ++i)
+  const auto snapshot = snapshotEndpoints();
+  for (uint8_t i = 0; i < snapshot.numReaders; ++i)
   {
-    if (writerTopicData.matchesTopicOf(m_readers[i]->m_attributes) &&
+    auto *reader = snapshot.readers[i];
+    if (writerTopicData.matchesTopicOf(reader->m_attributes) &&
         (writerTopicData.reliabilityKind == ReliabilityKind_t::RELIABLE ||
-         m_readers[i]->m_attributes.reliabilityKind ==
-             ReliabilityKind_t::BEST_EFFORT))
-    {
-      return m_readers[i];
-    }
+         reader->m_attributes.reliabilityKind == ReliabilityKind_t::BEST_EFFORT))
+      return reader;
   }
   return nullptr;
 }
@@ -290,26 +315,26 @@ bool Participant::removeRemoteParticipant(const GuidPrefix_t &prefix)
   {
     return (*static_cast<decltype(isElementToRemove) *>(arg))(value);
   };
+  {
+    Lock lock{m_mutex};
+    if (!m_remoteParticipants.remove(thunk, &isElementToRemove)) return false;
+  }
   removeAllEntitiesOfParticipant(prefix);
   m_sedpAgent.removeUnmatchedEntitiesOfParticipant(prefix);
-  return m_remoteParticipants.remove(thunk, &isElementToRemove);
+  return true;
 }
 
 void Participant::removeAllEntitiesOfParticipant(const GuidPrefix_t &prefix)
 {
-  for (auto i = 0; i < m_numWriters; i++)
-  {
-    m_writers[i]->removeReaderOfParticipant(prefix);
-  }
-
-  for (auto i = 0; i < m_numReaders; i++)
-  {
-    m_readers[i]->removeWriterOfParticipant(prefix);
-  }
+  const auto snapshot = snapshotEndpoints();
+  for (uint8_t i = 0; i < snapshot.numWriters; ++i)
+    snapshot.writers[i]->removeReaderOfParticipant(prefix);
+  for (uint8_t i = 0; i < snapshot.numReaders; ++i)
+    snapshot.readers[i]->removeWriterOfParticipant(prefix);
 }
 
-const rtps::ParticipantProxyData *
-Participant::findRemoteParticipant(const GuidPrefix_t &prefix)
+bool Participant::copyRemoteParticipant(const GuidPrefix_t &prefix,
+                                         ParticipantProxyData &snapshot)
 {
   auto isElementToFind = [&](const ParticipantProxyData &proxy)
   {
@@ -320,7 +345,18 @@ Participant::findRemoteParticipant(const GuidPrefix_t &prefix)
     return (*static_cast<decltype(isElementToFind) *>(arg))(value);
   };
   Lock lock{m_mutex};
-  return m_remoteParticipants.find(thunk, &isElementToFind);
+  const auto *remote = m_remoteParticipants.find(thunk, &isElementToFind);
+  if (remote == nullptr) return false;
+  snapshot = *remote;
+  return true;
+}
+
+bool Participant::hasRemoteParticipant(const GuidPrefix_t &prefix)
+{
+  Lock lock{m_mutex};
+  for (const auto &remote : m_remoteParticipants)
+    if (remote.m_guid.prefix == prefix) return true;
+  return false;
 }
 
 void Participant::refreshRemoteParticipantLiveliness(
@@ -336,14 +372,15 @@ void Participant::refreshRemoteParticipantLiveliness(
   };
   Lock lock{m_mutex};
   auto remoteParticipant = m_remoteParticipants.find(thunk, &isElementToFind);
-  remoteParticipant->onAliveSignal();
+  if (remoteParticipant != nullptr) remoteParticipant->onAliveSignal();
 }
 
 bool Participant::hasReaderWithMulticastLocator(ip4_addr_t address)
 {
-  for (uint8_t i = 0; i < m_numReaders; i++)
+  const auto snapshot = snapshotEndpoints();
+  for (uint8_t i = 0; i < snapshot.numReaders; i++)
   {
-    if (m_readers[i]->m_attributes.multicastLocator.isSameAddress(&address))
+    if (snapshot.readers[i]->m_attributes.multicastLocator.isSameAddress(&address))
     {
       return true;
     }
@@ -374,77 +411,61 @@ void Participant::addHeartbeat(GuidPrefix_t sourceGuidPrefix)
 
 bool Participant::checkAndResetHeartbeats()
 {
-  Lock lock{m_mutex};
-  PARTICIPANT_LOG("Have %u remote participants\n",
-                  (unsigned int)m_remoteParticipants.getNumElements());
-  PARTICIPANT_LOG(
-      "Unmatched remote writers/readers, %u / %u\n",
+  std::array<GuidPrefix_t, Config::SPDP_MAX_NUMBER_FOUND_PARTICIPANTS> expired{};
+  size_t count = 0;
+  {
+    Lock lock{m_mutex};
+    for (auto &remote : m_remoteParticipants)
+      if (!remote.isAlive()) expired[count++] = remote.m_guid.prefix;
+  }
+  // Never hold Participant while acquiring SEDP or endpoint locks.
+  PARTICIPANT_LOG("Unmatched remote writers/readers, %u / %u\n",
       static_cast<unsigned int>(m_sedpAgent.getNumRemoteUnmatchedWriters()),
       static_cast<unsigned int>(m_sedpAgent.getNumRemoteUnmatchedReaders()));
-  for (auto &remote : m_remoteParticipants)
-  {
-    PARTICIPANT_LOG("remote participant age = %u\n",
-                    (unsigned int)remote.getAliveSignalAgeInMilliseconds());
-    if (remote.isAlive())
-    {
-      PARTICIPANT_LOG("remote participant is alive\n");
-      continue;
-    }
-    PARTICIPANT_LOG("removing remote participant\n");
-    bool success = removeRemoteParticipant(remote.m_guid.prefix);
-    if (!success)
-    {
-      return false;
-    }
-  }
+  for (size_t i = 0; i < count; ++i) removeRemoteParticipant(expired[i]);
   return true;
 }
 
 rtps::SPDPAgent &Participant::getSPDPAgent() { return m_spdpAgent; }
 
-void Participant::addBuiltInEndpoints(BuiltInEndpoints &endpoints)
+bool Participant::hasBuiltInEndpoints() const
 {
-  m_hasBuilInEndpoints = true;
-  m_spdpAgent.init(*this, endpoints);
-  m_sedpAgent.init(*this, endpoints);
-
-  // This needs to be done after initializing the agents
-  addWriter(endpoints.spdpWriter);
-  addReader(endpoints.spdpReader);
-  addWriter(endpoints.sedpPubWriter);
-  addReader(endpoints.sedpPubReader);
-  addWriter(endpoints.sedpSubWriter);
-  addReader(endpoints.sedpSubReader);
+  Lock lock{m_mutex};
+  return m_hasBuilInEndpoints;
 }
 
-void Participant::refreshLocalLocators()
+bool Participant::addBuiltInEndpoints(BuiltInEndpoints &endpoints)
 {
-  const FullLengthLocator userLocator =
-      getUserUnicastLocator(m_participantId);
-
-  for (uint8_t i = 0; i < m_numWriters; ++i)
+  if (m_hasBuilInEndpoints || endpoints.spdpWriter == nullptr ||
+      endpoints.spdpReader == nullptr || endpoints.sedpPubWriter == nullptr ||
+      endpoints.sedpPubReader == nullptr || endpoints.sedpSubWriter == nullptr ||
+      endpoints.sedpSubReader == nullptr ||
+      m_writers.size() - m_numWriters < 3 ||
+      m_readers.size() - m_numReaders < 3)
   {
-    const EntityKind_t kind =
-        m_writers[i]->m_attributes.endpointGuid.entityId.entityKind;
-    if (kind != EntityKind_t::BUILD_IN_WRITER_WITH_KEY &&
-        kind != EntityKind_t::BUILD_IN_WRITER_WITHOUT_KEY)
-    {
-      m_writers[i]->m_attributes.unicastLocator = userLocator;
-      m_sedpAgent.addWriter(*m_writers[i]);
-    }
+    return false;
+  }
+  if (!m_spdpAgent.init(*this, endpoints))
+  {
+    return false;
+  }
+  if (!m_sedpAgent.init(*this, endpoints))
+  {
+    return false;
   }
 
-  for (uint8_t i = 0; i < m_numReaders; ++i)
+  // Single creation thread; publish all six builtin pointers atomically.
   {
-    const EntityKind_t kind =
-        m_readers[i]->m_attributes.endpointGuid.entityId.entityKind;
-    if (kind != EntityKind_t::BUILD_IN_READER_WITH_KEY &&
-        kind != EntityKind_t::BUILD_IN_READER_WITHOUT_KEY)
-    {
-      m_readers[i]->m_attributes.unicastLocator = userLocator;
-      m_sedpAgent.addReader(*m_readers[i]);
-    }
+    Lock lock{m_mutex};
+    m_writers[m_numWriters++] = endpoints.spdpWriter;
+    m_writers[m_numWriters++] = endpoints.sedpPubWriter;
+    m_writers[m_numWriters++] = endpoints.sedpSubWriter;
+    m_readers[m_numReaders++] = endpoints.spdpReader;
+    m_readers[m_numReaders++] = endpoints.sedpPubReader;
+    m_readers[m_numReaders++] = endpoints.sedpSubReader;
+    m_hasBuilInEndpoints = true;
   }
+  return true;
 }
 
 void Participant::newMessage(const uint8_t *data, DataSize_t size)

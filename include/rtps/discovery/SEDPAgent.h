@@ -31,15 +31,14 @@ Author: i11 - Embedded Software, RWTH Aachen University
 namespace rtps {
 
 class Participant;
+class SPDPAgent;
 class ReaderCacheChange;
 class Writer;
 class Reader;
 
 class SEDPAgent {
 public:
-  void init(Participant &part, const BuiltInEndpoints &endpoints);
-  void addWriter(Writer &writer);
-  void addReader(Reader &reader);
+  bool init(Participant &part, const BuiltInEndpoints &endpoints);
   void registerOnNewPublisherMatchedCallback(void (*callback)(void *arg),
                                              void *args);
   void registerOnNewSubscriberMatchedCallback(void (*callback)(void *arg),
@@ -53,7 +52,17 @@ protected: // For testing purposes
   void onNewSubscriber(const TopicData &writerData);
 
 private:
-  Participant *m_part;
+#if defined(RTPS_T10_TEST_ACCESS)
+  friend struct T10aHarness;
+#endif
+  friend class SPDPAgent;
+  friend class Participant;
+  bool registerWriter(Writer &writer, bool initialIpValid,
+                      uint32_t initialIp);
+  bool registerReader(Reader &reader, bool initialIpValid,
+                      uint32_t initialIp);
+  bool projectLocalIp(uint32_t networkOrderIp);
+  Participant *m_part = nullptr;
   sys_mutex_t m_mutex;
   uint8_t m_buffer[600]; // TODO check size, currently changed from 300 to 600
                          // (FastDDS gives too many options)

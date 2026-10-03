@@ -87,7 +87,9 @@ public:
   bool addNewRemoteParticipant(const ParticipantProxyData &remotePart);
   bool removeRemoteParticipant(const GuidPrefix_t &prefix);
   void removeAllEntitiesOfParticipant(const GuidPrefix_t &prefix);
-  const ParticipantProxyData *findRemoteParticipant(const GuidPrefix_t &prefix);
+  bool hasRemoteParticipant(const GuidPrefix_t &prefix);
+  bool copyRemoteParticipant(const GuidPrefix_t &prefix,
+                             ParticipantProxyData &snapshot);
   void refreshRemoteParticipantLiveliness(const GuidPrefix_t &prefix);
   uint32_t getRemoteParticipantCount();
   MessageReceiver *getMessageReceiver();
@@ -96,14 +98,28 @@ public:
 
   bool hasReaderWithMulticastLocator(ip4_addr_t address);
 
-  void addBuiltInEndpoints(BuiltInEndpoints &endpoints);
-  void refreshLocalLocators();
+  bool addBuiltInEndpoints(BuiltInEndpoints &endpoints);
+  bool hasBuiltInEndpoints() const;
   void newMessage(const uint8_t *data, DataSize_t size);
 
   SPDPAgent &getSPDPAgent();
 
 private:
+#if defined(RTPS_T10_TEST_ACCESS)
+  friend struct T10aHarness;
+#endif
   friend class SizeInspector;
+  friend class SEDPAgent;
+  friend class SPDPAgent;
+  struct EndpointSnapshot {
+    std::array<Writer *, Config::NUM_WRITERS_PER_PARTICIPANT> writers{};
+    std::array<Reader *, Config::NUM_READERS_PER_PARTICIPANT> readers{};
+    uint8_t numWriters = 0;
+    uint8_t numReaders = 0;
+  };
+  EndpointSnapshot snapshotEndpoints() const;
+  void publishRegisteredWriter(Writer *writer);
+  void publishRegisteredReader(Reader *reader);
   MessageReceiver m_receiver;
   bool m_hasBuilInEndpoints = false;
   std::array<uint8_t, 3> m_nextUserEntityId{{0, 0, 1}};
@@ -112,7 +128,7 @@ private:
   std::array<Reader *, Config::NUM_READERS_PER_PARTICIPANT> m_readers{};
   uint8_t m_numReaders = 0;
 
-  sys_mutex_t m_mutex;
+  mutable sys_mutex_t m_mutex;
   MemoryPool<ParticipantProxyData, Config::SPDP_MAX_NUMBER_FOUND_PARTICIPANTS>
       m_remoteParticipants;
 

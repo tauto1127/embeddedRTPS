@@ -36,6 +36,7 @@ namespace rtps
 {
 
   struct PBufWrapper;
+  class SPDPAgent;
 
   template <typename NetworkDriver>
   class StatelessWriterT : public Writer
@@ -60,6 +61,14 @@ namespace rtps
                       const GuidPrefix_t &sourceGuidPrefix) override;
 
   private:
+#if defined(RTPS_T10_TEST_ACCESS)
+    friend struct T10aHarness;
+#endif
+    friend class SPDPAgent;
+
+    void replacePreparedDiscoveryAlive(PBufWrapper &&payload) noexcept;
+    void notifyPreparedDiscovery() noexcept;
+
     sys_mutex_t m_mutex;
     ThreadPool *mp_threadPool = nullptr;
 

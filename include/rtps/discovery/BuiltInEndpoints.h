@@ -28,17 +28,17 @@ Author: i11 - Embedded Software, RWTH Aachen University
 #include "rtps/entities/StatefulReader.h"
 #include "rtps/entities/StatelessReader.h"
 #include "rtps/entities/StatelessWriter.h"
-#include "rtps/entities/Writer.h"
+#include "rtps/entities/StatefulWriter.h"
 
 namespace rtps {
 
 struct BuiltInEndpoints {
-  Writer *spdpWriter = nullptr;
-  Reader *spdpReader = nullptr;
-  Writer *sedpPubWriter = nullptr;
-  Reader *sedpPubReader = nullptr;
-  Writer *sedpSubWriter = nullptr;
-  Reader *sedpSubReader = nullptr;
+  StatelessWriter *spdpWriter = nullptr;
+  StatelessReader *spdpReader = nullptr;
+  StatefulWriter *sedpPubWriter = nullptr;
+  StatefulReader *sedpPubReader = nullptr;
+  StatefulWriter *sedpSubWriter = nullptr;
+  StatefulReader *sedpSubReader = nullptr;
 };
 } // namespace rtps
 
