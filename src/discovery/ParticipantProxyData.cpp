@@ -45,6 +45,10 @@ void ParticipantProxyData::reset() {
 bool ParticipantProxyData::readFromUcdrBuffer(ucdrBuffer &buffer,
                                               Participant *participant) {
   reset();
+  // The participant argument stays in the signature. A known GUID used to
+  // return here, before later locator parameters were copied into the buffer
+  // that reset() had just invalidated.
+  (void)participant;
   SMElement::ParameterId pid;
   uint16_t length;
   while (ucdr_buffer_remaining(&buffer) >= 4) {
@@ -87,10 +91,6 @@ bool ParticipantProxyData::readFromUcdrBuffer(ucdrBuffer &buffer,
                                      m_guid.entityId.entityKey.size());
       ucdr_deserialize_uint8_t(
           &buffer, reinterpret_cast<uint8_t *>(&m_guid.entityId.entityKind));
-      if (participant->findRemoteParticipant(m_guid.prefix)) {
-        SPDP_LOG("stopping deserialization early, participant is known\n");
-        return true;
-      }
       break;
     }
     case ParameterId::PID_METATRAFFIC_MULTICAST_LOCATOR: {
