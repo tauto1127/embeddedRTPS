@@ -31,7 +31,6 @@ Author: i11 - Embedded Software, RWTH Aachen University
 #include "rtps/messages/MessageTypes.h"
 #include "rtps/utils/Log.h"
 #include "rtps/utils/udpUtils.h"
-#include "rtps/communication/TcpipCoreLock.h"
 #include "netif_wasm_add.h"
 
 using rtps::SPDPAgent;
@@ -77,19 +76,11 @@ void SPDPAgent::start()
 
 void SPDPAgent::stop() { m_running = false; }
 
-bool SPDPAgent::refreshLocalIp()
+bool SPDPAgent::applyPendingLocalIpChange()
 {
-  int result;
-  {
-    TcpipCoreLock lock;
-    result = netif_wasm_refresh();
-  }
-  const int pending = netif_wasm_take_ip_changed();
-  if (result < 0) {
-    SPDP_LOG("Could not refresh local IP address\n");
-    return false;
-  }
-  if (result == 0 && pending == 0) {
+  /* The current address is probed only on the UDP receive EINTR path.
+   * This thread consumes that result and republishes discovery state. */
+  if (netif_wasm_take_ip_changed() == 0) {
     return false;
   }
 
@@ -121,7 +112,7 @@ void SPDPAgent::runBroadcast(void *args)
 #else
     sys_msleep(Config::SPDP_RESEND_PERIOD_MS);
 #endif
-    if (agent.refreshLocalIp()) {
+    if (agent.applyPendingLocalIpChange()) {
       announce();
     }
     agent.m_buildInEndpoints.spdpWriter->setAllChangesToUnsent();
