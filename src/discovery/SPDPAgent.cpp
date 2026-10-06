@@ -211,40 +211,11 @@ void SPDPAgent::processProxyData()
       mp_participant->findRemoteParticipant(m_proxyDataBuffer.m_guid.prefix);
   if (remote_part != nullptr)
   {
-    const auto locator_list_changed = [](const auto &old_list,
-                                         const auto &new_list) {
-      for (size_t i = 0; i < old_list.size(); ++i)
-      {
-        if (old_list[i].kind != new_list[i].kind ||
-            old_list[i].port != new_list[i].port ||
-            old_list[i].address != new_list[i].address)
-        {
-          return true;
-        }
-      }
-      return false;
-    };
-    const bool metatraffic_locator_changed = locator_list_changed(
-        remote_part->m_metatrafficUnicastLocatorList,
-        m_proxyDataBuffer.m_metatrafficUnicastLocatorList);
-    const bool default_locator_changed = locator_list_changed(
-        remote_part->m_defaultUnicastLocatorList,
-        m_proxyDataBuffer.m_defaultUnicastLocatorList);
     SPDP_LOG("Not adding remote participant guid.prefix = %u \n",
              (unsigned int)Guid_t::sum(remote_part->m_guid));
-
-    if (metatraffic_locator_changed || default_locator_changed)
-    {
-      const GuidPrefix_t prefix = m_proxyDataBuffer.m_guid.prefix;
-      mp_participant->removeRemoteParticipant(prefix);
-      if (mp_participant->addNewRemoteParticipant(m_proxyDataBuffer))
-      {
-        addProxiesForBuiltInEndpoints();
-        m_buildInEndpoints.spdpWriter->setAllChangesToUnsent();
-      }
-      return;
-    }
-
+    /* Keep this remote participant, including its user WriterProxy and
+     * ReaderProxy matches, when a later SPDP carries different locators.
+     * Rebuilding here would drop that matching state. */
     mp_participant->refreshRemoteParticipantLiveliness(
         m_proxyDataBuffer.m_guid.prefix);
     return; // Already in our list
