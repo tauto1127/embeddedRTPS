@@ -43,7 +43,8 @@ namespace rtps
   public:
     ~StatelessWriterT() override;
     bool init(TopicData attributes, TopicKind_t topicKind, ThreadPool *threadPool,
-              NetworkDriver &driver, bool enfUnicast = false);
+              NetworkDriver &driver, bool enfUnicast = false,
+              uint16_t historyDepth = Config::HISTORY_SIZE_STATELESS);
 
     bool addNewMatchedReader(const ReaderProxy &newProxy) override;
     void removeReader(const Guid_t &guid) override;
@@ -69,9 +70,11 @@ namespace rtps
 
     TopicKind_t m_topicKind = TopicKind_t::NO_KEY;
     SequenceNumber_t m_nextSequenceNumberToSend = {0, 1};
+    uint16_t m_historyDepth = Config::HISTORY_SIZE_STATELESS;
     SimpleHistoryCache<Config::HISTORY_SIZE_STATELESS> m_history;
 
     bool isIrrelevant(ChangeKind_t kind) const;
+    void enforceHistoryDepth();
 
     void manageSendOptions();
     void resetSendOptions();

@@ -181,7 +181,7 @@ void Domain::createBuiltinWritersAndReaders(Participant &part)
   spdpWriterAttributes.unicastLocator = getBuiltInMulticastLocator();
 
   spdpWriter.init(spdpWriterAttributes, TopicKind_t::WITH_KEY, &m_threadPool,
-                  m_transport);
+                  m_transport, false, 1);
   spdpWriter.addNewMatchedReader(
       ReaderProxy{{part.m_guidPrefix, ENTITYID_SPDP_BUILTIN_PARTICIPANT_READER},
                   getBuiltInMulticastLocator()});

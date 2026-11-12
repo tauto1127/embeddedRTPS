@@ -65,8 +65,15 @@ bool StatelessWriterT<NetworkDriver>::init(TopicData attributes,
                                            TopicKind_t topicKind,
                                            ThreadPool *threadPool,
                                            NetworkDriver &driver,
-                                           bool enfUnicast)
+                                           bool enfUnicast,
+                                           uint16_t historyDepth)
 {
+  if (historyDepth == 0 ||
+      historyDepth > Config::HISTORY_SIZE_STATELESS)
+  {
+    return false;
+  }
+
   if (sys_mutex_new(&m_mutex) != ERR_OK)
   {
 #if SLW_VERBOSE
@@ -81,9 +88,25 @@ bool StatelessWriterT<NetworkDriver>::init(TopicData attributes,
   mp_threadPool = threadPool;
   m_transport = &driver;
   m_enforceUnicast = enfUnicast;
+  m_historyDepth = historyDepth;
 
   m_is_initialized_ = true;
   return true;
+}
+
+template <class NetworkDriver>
+void StatelessWriterT<NetworkDriver>::enforceHistoryDepth()
+{
+  while (m_history.getNumChanges() > m_historyDepth)
+  {
+    m_history.dropOldest();
+  }
+
+  const SequenceNumber_t minSequenceNumber = m_history.getSeqNumMin();
+  if (m_nextSequenceNumberToSend < minSequenceNumber)
+  {
+    m_nextSequenceNumberToSend = minSequenceNumber;
+  }
 }
 
 template <class NetworkDriver>
@@ -210,19 +233,9 @@ const rtps::CacheChange *StatelessWriterT<NetworkDriver>::newChangeIdentify(
 
   Lock lock{m_mutex};
 
-  if (m_history.isFull())
-  {
-    // Right now we drop elements anyway because we cannot detect non-responding
-    // readers yet. return nullptr;
-    SequenceNumber_t newMin = ++SequenceNumber_t(m_history.getSeqNumMin());
-    if (m_nextSequenceNumberToSend < newMin)
-    {
-      m_nextSequenceNumberToSend =
-          newMin; // Make sure we have the correct sn to send
-    }
-  }
-
   auto *result = m_history.addChange(data, size, identify);
+  enforceHistoryDepth();
+
   const bool empty_sample_identity =
       std::all_of(identify.guidPrefix.id.begin(), identify.guidPrefix.id.end(),
                   [](uint8_t byte) { return byte == 0; }) &&
@@ -258,17 +271,8 @@ const CacheChange *StatelessWriterT<NetworkDriver>::newChangeCallback(
   }
   Lock lock(m_mutex);
 
-  if (m_history.isFull())
-  {
-    SequenceNumber_t newMin = ++SequenceNumber_t(m_history.getSeqNumMin());
-    if (m_nextSequenceNumberToSend < newMin)
-    {
-      m_nextSequenceNumberToSend =
-          newMin; // Make sure we have the correct sn to send
-    }
-  }
-
   auto *result = m_history.addChange(func, size);
+  enforceHistoryDepth();
   if (mp_threadPool != nullptr)
   {
     mp_threadPool->addWorkload(this);
@@ -288,17 +292,8 @@ const CacheChange *StatelessWriterT<NetworkDriver>::newChange(
   }
   Lock lock(m_mutex);
 
-  if (m_history.isFull())
-  {
-    SequenceNumber_t newMin = ++SequenceNumber_t(m_history.getSeqNumMin());
-    if (m_nextSequenceNumberToSend < newMin)
-    {
-      m_nextSequenceNumberToSend =
-          newMin; // Make sure we have the correct sn to send
-    }
-  }
-
   auto *result = m_history.addChange(data, size);
+  enforceHistoryDepth();
   if (mp_threadPool != nullptr)
   {
     mp_threadPool->addWorkload(this);

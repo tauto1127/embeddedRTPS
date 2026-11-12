@@ -44,6 +44,15 @@ namespace rtps
   public:
     SimpleHistoryCache() = default;
 
+    uint16_t getNumChanges() const
+    {
+      if (m_head >= m_tail)
+      {
+        return static_cast<uint16_t>(m_head - m_tail);
+      }
+      return static_cast<uint16_t>(m_buffer.size() - m_tail + m_head);
+    }
+
     bool isFull() const
     {
       uint16_t it = m_head;
