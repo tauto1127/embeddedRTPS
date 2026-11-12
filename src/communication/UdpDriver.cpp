@@ -28,9 +28,38 @@ Author: i11 - Embedded Software, RWTH Aachen University
 #include "rtps/utils/Log.h"
 
 #include <lwip/igmp.h>
+#include <lwip/pbuf.h>
 #include <lwip/tcpip.h>
 
+#include <stdio.h>
+#include <string.h>
+
 using rtps::UdpDriver;
+
+// Experiment-only one-shot drop for the SEDP locator trials.
+// Armed from the trial app. Inactive unless that app calls it.
+static volatile int g_sedp_drop_armed = 0;
+static const char k_sedp_drop_marker[] = "migration_after_restore";
+
+extern "C" void mros2_experiment_arm_sedp_drop(void) {
+  g_sedp_drop_armed = 1;
+  printf("event=sedp_drop_armed marker=%s\n", k_sedp_drop_marker);
+}
+
+static bool pbuf_has_marker(pbuf *packet) {
+  unsigned char bytes[1600];
+  u16_t copied = pbuf_copy_partial(packet, bytes, sizeof(bytes), 0);
+  if (copied < sizeof(k_sedp_drop_marker) - 1) {
+    return false;
+  }
+  const size_t marker_len = sizeof(k_sedp_drop_marker) - 1;
+  for (u16_t i = 0; i + marker_len <= copied; ++i) {
+    if (memcmp(bytes + i, k_sedp_drop_marker, marker_len) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
 
 #if UDP_DRIVER_VERBOSE && RTPS_GLOBAL_VERBOSE
 #include "rtps/utils/printutils.h"
@@ -133,6 +162,14 @@ bool UdpDriver::sendPacket(const UdpConnection &conn, ip4_addr_t &destAddr,
 }
 
 void UdpDriver::sendPacket(PacketInfo &packet) {
+  if (g_sedp_drop_armed && packet.buffer.firstElement != nullptr &&
+      pbuf_has_marker(packet.buffer.firstElement)) {
+    g_sedp_drop_armed = 0;
+    printf("event=sedp_drop_once dst=%s port=%u len=%u\n",
+           ip4addr_ntoa(&packet.destAddr), packet.destPort,
+           packet.buffer.firstElement->tot_len);
+    return;
+  }
   auto p_conn = createUdpConnection(packet.srcPort);
   if (p_conn == nullptr) {
     ;
