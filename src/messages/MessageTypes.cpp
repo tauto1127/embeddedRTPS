@@ -214,11 +214,70 @@ bool rtps::deserializeMessage(const MessageProcessingInfo &info,
 
   if (msg.readerSNState.numBits != 0)
   {
+    // Fast DDS sends up to 256 bits; keep what fits and skip the rest instead
+    // of writing past bitMap.
+    const size_t bytes =
+        SequenceNumberSet::bitmapBytes(msg.readerSNState.numBits);
+    const size_t kept = bytes < sizeof(msg.readerSNState.bitMap)
+                            ? bytes
+                            : sizeof(msg.readerSNState.bitMap);
     doCopyAndMoveOn(
         reinterpret_cast<uint8_t *>(msg.readerSNState.bitMap.data()),
-        currentPos, 4 * ((msg.readerSNState.numBits / 32) + 1));
+        currentPos, kept);
+    currentPos += bytes - kept;
   }
   doCopyAndMoveOn(reinterpret_cast<uint8_t *>(&msg.count.value), currentPos,
                   sizeof(msg.count.value));
+  return true;
+}
+
+bool rtps::deserializeMessage(const MessageProcessingInfo &info,
+                              SubmessageGap &msg)
+{
+  const DataSize_t remainingSizeAtBeginning = info.getRemainingSize();
+  if (remainingSizeAtBeginning < SubmessageGap::getRawSizeWithoutBitmap())
+  {
+    return false;
+  }
+  if (!deserializeMessage(info, msg.header))
+  {
+    return false;
+  }
+
+  const uint8_t *currentPos =
+      info.getPointerToCurrentPos() + SubmessageHeader::getRawSize();
+
+  doCopyAndMoveOn(msg.readerId.entityKey.data(), currentPos,
+                  msg.readerId.entityKey.size());
+  msg.readerId.entityKind = static_cast<EntityKind_t>(*currentPos++);
+  doCopyAndMoveOn(msg.writerId.entityKey.data(), currentPos,
+                  msg.writerId.entityKey.size());
+  msg.writerId.entityKind = static_cast<EntityKind_t>(*currentPos++);
+  doCopyAndMoveOn(reinterpret_cast<uint8_t *>(&msg.gapStart.high), currentPos,
+                  sizeof(msg.gapStart.high));
+  doCopyAndMoveOn(reinterpret_cast<uint8_t *>(&msg.gapStart.low), currentPos,
+                  sizeof(msg.gapStart.low));
+  doCopyAndMoveOn(reinterpret_cast<uint8_t *>(&msg.gapList.base.high),
+                  currentPos, sizeof(msg.gapList.base.high));
+  doCopyAndMoveOn(reinterpret_cast<uint8_t *>(&msg.gapList.base.low),
+                  currentPos, sizeof(msg.gapList.base.low));
+  doCopyAndMoveOn(reinterpret_cast<uint8_t *>(&msg.gapList.numBits),
+                  currentPos, sizeof(uint32_t));
+
+  const size_t bytes = SequenceNumberSet::bitmapBytes(msg.gapList.numBits);
+  if (remainingSizeAtBeginning <
+      SubmessageGap::getRawSizeWithoutBitmap() + bytes)
+  {
+    return false;
+  }
+  msg.gapList.bitMap.fill(0);
+  const size_t kept =
+      bytes < sizeof(msg.gapList.bitMap) ? bytes : sizeof(msg.gapList.bitMap);
+  doCopyAndMoveOn(reinterpret_cast<uint8_t *>(msg.gapList.bitMap.data()),
+                  currentPos, kept);
+  if (msg.gapList.numBits > SNS_NUM_BITS)
+  {
+    msg.gapList.numBits = SNS_NUM_BITS;
+  }
   return true;
 }

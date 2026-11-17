@@ -26,12 +26,25 @@ Author: i11 - Embedded Software, RWTH Aachen University
 #define RTPS_WRITERPROXY_H
 
 #include "rtps/common/types.h"
+#include <cstdint>
 #include <rtps/common/Locator.h>
 
 namespace rtps {
+
+inline uint64_t snToU64(const SequenceNumber_t &sn) {
+  return (static_cast<uint64_t>(static_cast<uint32_t>(sn.high)) << 32) | sn.low;
+}
+
+inline SequenceNumber_t snFromU64(uint64_t value) {
+  return SequenceNumber_t{static_cast<int32_t>(value >> 32),
+                          static_cast<uint32_t>(value)};
+}
+
 struct WriterProxy {
   Guid_t remoteWriterGuid;
   SequenceNumber_t expectedSN;
+  //! Bit i set: expectedSN + i was declared irrelevant (GAP) and will not come.
+  uint32_t irrelevantMask = 0;
   Count_t ackNackCount;
   Count_t hbCount;
   LocatorIPv4 remoteLocator;
@@ -40,8 +53,18 @@ struct WriterProxy {
 
   WriterProxy(const Guid_t &guid, const LocatorIPv4 &loc)
       : remoteWriterGuid(guid),
-        expectedSN(SequenceNumber_t{0, 1}), ackNackCount{1}, hbCount{0},
-        remoteLocator(loc) {}
+        expectedSN(SequenceNumber_t{0, 1}), irrelevantMask(0), ackNackCount{1},
+        hbCount{0}, remoteLocator(loc) {}
+
+  //! Move expectedSN forward to sn, keeping irrelevantMask aligned.
+  void advanceTo(const SequenceNumber_t &sn) {
+    if (!(expectedSN < sn)) {
+      return;
+    }
+    const uint64_t distance = snToU64(sn) - snToU64(expectedSN);
+    irrelevantMask = distance >= 32 ? 0 : irrelevantMask >> distance;
+    expectedSN = sn;
+  }
 
   // For now, we don't store any packets, so we just request all starting from
   // the next expected

@@ -220,6 +220,12 @@ namespace rtps
     uint32_t numBits = SNS_NUM_BITS;
     std::array<uint32_t, 1> bitMap{};
 
+    //! Size of the serialized bitmap: ceil(numBits / 32) longs (RTPS 9.4.2.6).
+    static uint32_t bitmapBytes(uint32_t numBits)
+    {
+      return 4 * ((numBits + 31) / 32);
+    }
+
     // We only need 1 byte because atm we don't store packets.
     bool isSet(uint32_t bit) const
     {
