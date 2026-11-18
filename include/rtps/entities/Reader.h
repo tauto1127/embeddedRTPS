@@ -37,6 +37,7 @@ namespace rtps
 {
 
   struct SubmessageHeartbeat;
+  struct SubmessageGap;
 
   class ReaderCacheChange
   {
@@ -103,6 +104,12 @@ namespace rtps
     virtual void registerCallback(ddsReaderCallback_fp cb, void *callee) = 0;
     virtual bool onNewHeartbeat(const SubmessageHeartbeat &msg,
                                 const GuidPrefix_t &remotePrefix) = 0;
+    //! Only reliable (stateful) readers care about GAP.
+    virtual bool onNewGap(const SubmessageGap & /*msg*/,
+                          const GuidPrefix_t & /*remotePrefix*/)
+    {
+      return false;
+    }
     virtual bool addNewMatchedWriter(const WriterProxy &newProxy) = 0;
     virtual void removeWriter(const Guid_t &guid) = 0;
     virtual void removeWriterOfParticipant(const GuidPrefix_t &guidPrefix) = 0;

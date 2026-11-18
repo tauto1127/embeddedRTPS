@@ -28,6 +28,9 @@ Author: i11 - Embedded Software, RWTH Aachen University
 #include "rtps/messages/MessageFactory.h"
 #include "rtps/utils/Lock.h"
 
+#include <cstdio>
+#include <cstdlib>
+
 #if SFR_VERBOSE && RTPS_GLOBAL_VERBOSE
 #include "rtps/utils/printutils.h"
 #define SFR_LOG(...)                                            \
@@ -43,6 +46,23 @@ Author: i11 - Embedded Software, RWTH Aachen University
 
 using rtps::StatefulReaderT;
 
+// Rare reliability events (skip, GAP, full buffer) go to stdout so experiments
+// can see them without enabling the verbose log.
+#ifndef SFR_RELIABILITY_LOG
+#define SFR_RELIABILITY_LOG 1
+#endif
+#if SFR_RELIABILITY_LOG
+#define SFR_EVENT(...)                                          \
+  do                                                            \
+  {                                                             \
+    printf("[StatefulReader %s] ", &m_attributes.topicName[0]); \
+    printf(__VA_ARGS__);                                        \
+    printf("\n");                                               \
+  } while (0)
+#else
+#define SFR_EVENT(...)
+#endif
+
 template <class NetworkDriver>
 StatefulReaderT<NetworkDriver>::~StatefulReaderT()
 {
@@ -50,6 +70,10 @@ StatefulReaderT<NetworkDriver>::~StatefulReaderT()
   //  seems sth strange
   //    sys_mutex_free(&m_mutex);
   //  }
+  for (auto &slot : m_buffered)
+  {
+    freeSlot(slot);
+  }
 }
 
 // NetworkDriverの中にパケット受信しのコールバックが指定されてそう
@@ -70,6 +94,9 @@ void StatefulReaderT<NetworkDriver>::init(const TopicData &attributes,
   m_is_initialized_ = true;
 }
 
+// Fast DDS-like reception: deliver in SN order, keep changes that arrive after
+// a missing one, and give up on an SN only when the writer says it is gone
+// (HEARTBEAT firstSN or GAP).
 template <class NetworkDriver>
 void StatefulReaderT<NetworkDriver>::newChange(
     const ReaderCacheChange &cacheChange)
@@ -79,77 +106,24 @@ void StatefulReaderT<NetworkDriver>::newChange(
     return;
   }
   Lock lock{m_mutex};
-  for (auto &proxy : m_proxies)
+  WriterProxy *proxy = findProxy(cacheChange.writerGuid);
+  if (proxy == nullptr)
   {
-    if (proxy.remoteWriterGuid == cacheChange.writerGuid)
-    {
-      const bool is_service_reply =
-          m_attributes.topicName[0] == 'r' &&
-          m_attributes.topicName[1] == 'r' &&
-          m_attributes.topicName[2] == '/';
-      const bool service_reply_after_gap =
-          is_service_reply && proxy.expectedSN < cacheChange.sn;
-
-      // Service replies are correlated by PID_RELATED_SAMPLE_IDENTITY rather
-      // than by the response writer's RTPS sequence number.  If an earlier
-      // reply was lost (or intentionally abandoned after an application
-      // timeout), blocking every later independent reply behind that gap makes
-      // the client fail permanently.  This reader has no out-of-order cache,
-      // so service replies resynchronize at the newest delivered sample.
-      if (service_reply_after_gap)
-      {
-        printf("[RTPS RX] service response gap skipped: expected=%d:%u received=%d:%u\n",
-               proxy.expectedSN.high, proxy.expectedSN.low,
-               cacheChange.sn.high, cacheChange.sn.low);
-      }
-
-      if (proxy.expectedSN == cacheChange.sn || service_reply_after_gap)
-      {
-        m_callback(m_callee, cacheChange);
-        proxy.expectedSN = cacheChange.sn;
-        ++proxy.expectedSN;
-
-        // A ROS 2 service reply reader must release the server writer's
-        // reliable history promptly.  Waiting for a later HEARTBEAT can leave
-        // the last delivered reply unacknowledged indefinitely; with the
-        // default service history depth this eventually stalls replies after
-        // roughly ten calls.  Send a cumulative final ACK immediately after
-        // accepting each Reply sample.
-        if (is_service_reply)
-        {
-          PacketInfo info;
-          info.srcPort = m_packetInfo.srcPort;
-          info.destAddr = proxy.remoteLocator.getIp4Address();
-          info.destPort = proxy.remoteLocator.port;
-
-          SequenceNumberSet acked;
-          acked.base = proxy.expectedSN;
-          acked.numBits = 0;
-          const Count_t count = proxy.getNextAckNackCount();
-
-          rtps::MessageFactory::addHeader(
-              info.buffer, m_attributes.endpointGuid.prefix);
-          rtps::MessageFactory::addAckNack(
-              info.buffer, proxy.remoteWriterGuid.entityId,
-              m_attributes.endpointGuid.entityId, acked, count, true);
-
-          printf("[RTPS RX] service response ACK: received=%d:%u base=%d:%u count=%d src_port=%u dst_port=%u\n",
-                 cacheChange.sn.high, cacheChange.sn.low,
-                 acked.base.high, acked.base.low, count.value,
-                 static_cast<unsigned int>(info.srcPort),
-                 static_cast<unsigned int>(info.destPort));
-          m_transport->sendPacket(info);
-        }
-        return;
-      }
-
-      if (is_service_reply)
-      {
-        printf("[RTPS RX] service response DATA ignored: received=%d:%u expected=%d:%u\n",
-               cacheChange.sn.high, cacheChange.sn.low,
-               proxy.expectedSN.high, proxy.expectedSN.low);
-      }
-    }
+    return;
+  }
+  if (cacheChange.sn < proxy->expectedSN)
+  {
+    return; // already delivered or given up
+  }
+  if (cacheChange.sn == proxy->expectedSN)
+  {
+    deliver(cacheChange, *proxy);
+    deliverInOrder(*proxy);
+    return;
+  }
+  if (!isBuffered(cacheChange.writerGuid, cacheChange.sn))
+  {
+    store(cacheChange);
   }
 }
 
@@ -195,6 +169,7 @@ void StatefulReaderT<NetworkDriver>::removeWriter(const Guid_t &guid)
   };
 
   m_proxies.remove(thunk, &isElementToRemove);
+  dropBufferedOf(guid);
 }
 
 template <class NetworkDriver>
@@ -212,6 +187,7 @@ void StatefulReaderT<NetworkDriver>::removeWriterOfParticipant(
   };
 
   m_proxies.remove(thunk, &isElementToRemove);
+  dropBufferedOfParticipant(guidPrefix);
 }
 
 template <class NetworkDriver>
@@ -221,17 +197,7 @@ bool StatefulReaderT<NetworkDriver>::onNewHeartbeat(
   Lock lock(m_mutex);
   PacketInfo info;
   info.srcPort = m_packetInfo.srcPort;
-  WriterProxy *writer = nullptr;
-  // Search for writer
-  for (WriterProxy &proxy : m_proxies)
-  {
-    if (proxy.remoteWriterGuid.prefix == sourceGuidPrefix &&
-        proxy.remoteWriterGuid.entityId == msg.writerId)
-    {
-      writer = &proxy;
-      break;
-    }
-  }
+  WriterProxy *writer = findProxy(Guid_t{sourceGuidPrefix, msg.writerId});
 
   if (writer == nullptr)
   {
@@ -253,12 +219,22 @@ bool StatefulReaderT<NetworkDriver>::onNewHeartbeat(
   }
 
   writer->hbCount.value = msg.count.value;
+
+  // The writer no longer has anything before firstSN.
+  if (writer->expectedSN < msg.firstSN)
+  {
+    SFR_EVENT("heartbeat firstSN %u skips from %u",
+              static_cast<unsigned>(msg.firstSN.low),
+              static_cast<unsigned>(writer->expectedSN.low));
+    skipTo(*writer, msg.firstSN);
+  }
+
   info.destAddr = writer->remoteLocator.getIp4Address();
   info.destPort = writer->remoteLocator.port;
   rtps::MessageFactory::addHeader(info.buffer,
                                   m_attributes.endpointGuid.prefix);
   rtps::MessageFactory::addAckNack(info.buffer, msg.writerId, msg.readerId,
-                                   writer->getMissing(msg.firstSN, msg.lastSN),
+                                   getMissing(*writer, msg.lastSN),
                                    writer->getNextAckNackCount(), false);
 
   SFR_LOG("Sending acknack.\n");
@@ -266,4 +242,265 @@ bool StatefulReaderT<NetworkDriver>::onNewHeartbeat(
   return true;
 }
 
+template <class NetworkDriver>
+bool StatefulReaderT<NetworkDriver>::onNewGap(
+    const SubmessageGap &msg, const GuidPrefix_t &sourceGuidPrefix)
+{
+  Lock lock(m_mutex);
+  WriterProxy *writer = findProxy(Guid_t{sourceGuidPrefix, msg.writerId});
+  if (writer == nullptr)
+  {
+    return false;
+  }
+  SFR_EVENT("gap %u..%u (+%u bits), expected %u",
+            static_cast<unsigned>(msg.gapStart.low),
+            static_cast<unsigned>(msg.gapList.base.low),
+            static_cast<unsigned>(msg.gapList.numBits),
+            static_cast<unsigned>(writer->expectedSN.low));
+  markIrrelevant(*writer, msg.gapStart, msg.gapList.base);
+  for (uint32_t i = 0; i < msg.gapList.numBits; ++i)
+  {
+    if (msg.gapList.isSet(i))
+    {
+      const uint64_t sn = snToU64(msg.gapList.base) + i;
+      markIrrelevant(*writer, snFromU64(sn), snFromU64(sn + 1));
+    }
+  }
+  deliverInOrder(*writer);
+  return true;
+}
+
+// ---- helpers (all called with m_mutex held) ----
+
+template <class NetworkDriver>
+rtps::WriterProxy *
+StatefulReaderT<NetworkDriver>::findProxy(const Guid_t &writerGuid)
+{
+  for (WriterProxy &proxy : m_proxies)
+  {
+    if (proxy.remoteWriterGuid == writerGuid)
+    {
+      return &proxy;
+    }
+  }
+  return nullptr;
+}
+
+template <class NetworkDriver>
+void StatefulReaderT<NetworkDriver>::deliver(const ReaderCacheChange &change,
+                                             WriterProxy &proxy)
+{
+  m_callback(m_callee, change);
+  proxy.advanceTo(snFromU64(snToU64(proxy.expectedSN) + 1));
+}
+
+template <class NetworkDriver>
+void StatefulReaderT<NetworkDriver>::deliverBuffered(BufferedChange &slot,
+                                                     WriterProxy &proxy)
+{
+  ReaderCacheChange change{slot.kind,     slot.writerGuid, slot.sn,
+                           slot.data,     slot.size,       slot.response,
+                           slot.identify};
+  deliver(change, proxy);
+  freeSlot(slot);
+}
+
+template <class NetworkDriver>
+typename StatefulReaderT<NetworkDriver>::BufferedChange *
+StatefulReaderT<NetworkDriver>::findBuffered(const Guid_t &writerGuid,
+                                             const SequenceNumber_t &sn)
+{
+  for (auto &slot : m_buffered)
+  {
+    if (slot.used && slot.sn == sn && slot.writerGuid == writerGuid)
+    {
+      return &slot;
+    }
+  }
+  return nullptr;
+}
+
+template <class NetworkDriver>
+bool StatefulReaderT<NetworkDriver>::isBuffered(const Guid_t &writerGuid,
+                                                const SequenceNumber_t &sn)
+{
+  return findBuffered(writerGuid, sn) != nullptr;
+}
+
+template <class NetworkDriver>
+void StatefulReaderT<NetworkDriver>::store(const ReaderCacheChange &change)
+{
+  for (auto &slot : m_buffered)
+  {
+    if (slot.used)
+    {
+      continue;
+    }
+    uint8_t *copy = nullptr;
+    if (change.size != 0)
+    {
+      copy = static_cast<uint8_t *>(malloc(change.size));
+      if (copy == nullptr || !change.copyInto(copy, change.size))
+      {
+        free(copy);
+        return;
+      }
+    }
+    slot.used = true;
+    slot.writerGuid = change.writerGuid;
+    slot.sn = change.sn;
+    slot.kind = change.kind;
+    slot.response = change.response;
+    slot.identify = change.identify;
+    slot.size = change.size;
+    slot.data = copy;
+    return;
+  }
+  // Full: the change will be requested again by the next ACKNACK.
+  SFR_EVENT("buffer full, not keeping sn %u",
+            static_cast<unsigned>(change.sn.low));
+}
+
+template <class NetworkDriver>
+void StatefulReaderT<NetworkDriver>::freeSlot(BufferedChange &slot)
+{
+  if (slot.used)
+  {
+    free(slot.data);
+  }
+  slot.used = false;
+  slot.data = nullptr;
+  slot.size = 0;
+}
+
+template <class NetworkDriver>
+void StatefulReaderT<NetworkDriver>::dropBufferedOf(const Guid_t &writerGuid)
+{
+  for (auto &slot : m_buffered)
+  {
+    if (slot.used && slot.writerGuid == writerGuid)
+    {
+      freeSlot(slot);
+    }
+  }
+}
+
+template <class NetworkDriver>
+void StatefulReaderT<NetworkDriver>::dropBufferedOfParticipant(
+    const GuidPrefix_t &prefix)
+{
+  for (auto &slot : m_buffered)
+  {
+    if (slot.used && slot.writerGuid.prefix == prefix)
+    {
+      freeSlot(slot);
+    }
+  }
+}
+
+template <class NetworkDriver>
+void StatefulReaderT<NetworkDriver>::deliverInOrder(WriterProxy &proxy)
+{
+  while (true)
+  {
+    BufferedChange *slot =
+        findBuffered(proxy.remoteWriterGuid, proxy.expectedSN);
+    if (slot != nullptr)
+    {
+      deliverBuffered(*slot, proxy);
+      continue;
+    }
+    if ((proxy.irrelevantMask & 1u) != 0)
+    {
+      proxy.advanceTo(snFromU64(snToU64(proxy.expectedSN) + 1));
+      continue;
+    }
+    return;
+  }
+}
+
+// Everything before newExpected is either kept here or will never come:
+// deliver what we have in order and move on.
+template <class NetworkDriver>
+void StatefulReaderT<NetworkDriver>::skipTo(WriterProxy &proxy,
+                                            const SequenceNumber_t &newExpected)
+{
+  while (proxy.expectedSN < newExpected)
+  {
+    BufferedChange *next = nullptr;
+    for (auto &slot : m_buffered)
+    {
+      if (slot.used && slot.writerGuid == proxy.remoteWriterGuid &&
+          slot.sn < newExpected && (next == nullptr || slot.sn < next->sn))
+      {
+        next = &slot;
+      }
+    }
+    if (next == nullptr)
+    {
+      break;
+    }
+    proxy.advanceTo(next->sn);
+    deliverBuffered(*next, proxy);
+  }
+  proxy.advanceTo(newExpected);
+  deliverInOrder(proxy);
+}
+
+template <class NetworkDriver>
+void StatefulReaderT<NetworkDriver>::markIrrelevant(
+    WriterProxy &proxy, const SequenceNumber_t &from,
+    const SequenceNumber_t &toExclusive)
+{
+  if (!(from < toExclusive) || !(proxy.expectedSN < toExclusive))
+  {
+    return;
+  }
+  if (from <= proxy.expectedSN)
+  {
+    skipTo(proxy, toExclusive);
+    return;
+  }
+  const uint64_t expected = snToU64(proxy.expectedSN);
+  const uint64_t end = snToU64(toExclusive);
+  for (uint64_t sn = snToU64(from); sn < end && sn - expected < 32; ++sn)
+  {
+    proxy.irrelevantMask |= uint32_t{1} << (sn - expected);
+  }
+}
+
+// base = expectedSN; a bit is set for every SN up to lastAvail (at most 32)
+// that is neither kept here nor declared irrelevant.
+template <class NetworkDriver>
+rtps::SequenceNumberSet
+StatefulReaderT<NetworkDriver>::getMissing(WriterProxy &proxy,
+                                           const SequenceNumber_t &lastAvail)
+{
+  SequenceNumberSet set;
+  set.base = proxy.expectedSN;
+  set.bitMap.fill(0);
+  if (lastAvail < proxy.expectedSN)
+  {
+    set.numBits = 0;
+    return set;
+  }
+  uint64_t count = snToU64(lastAvail) - snToU64(proxy.expectedSN) + 1;
+  if (count > SNS_NUM_BITS)
+  {
+    count = SNS_NUM_BITS;
+  }
+  set.numBits = static_cast<uint32_t>(count);
+  for (uint32_t i = 0; i < set.numBits; ++i)
+  {
+    const SequenceNumber_t sn = snFromU64(snToU64(proxy.expectedSN) + i);
+    if ((proxy.irrelevantMask & (uint32_t{1} << i)) == 0 &&
+        !isBuffered(proxy.remoteWriterGuid, sn))
+    {
+      set.bitMap[0] |= uint32_t{1} << (31 - i);
+    }
+  }
+  return set;
+}
+
+#undef SFR_EVENT
 #undef SFR_VERBOSE

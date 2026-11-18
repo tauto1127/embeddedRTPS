@@ -244,6 +244,22 @@ namespace rtps
     }
   };
 
+  //! GAP (RTPS 8.3.7.4): gapStart..gapList.base-1 and every SN set in gapList
+  //! are irrelevant to the reader. Only the first bitmap long is kept.
+  struct SubmessageGap
+  {
+    SubmessageHeader header;
+    EntityId_t readerId;
+    EntityId_t writerId;
+    SequenceNumber_t gapStart;
+    SequenceNumberSet gapList;
+    static constexpr uint16_t getRawSizeWithoutBitmap()
+    {
+      return SubmessageHeader::getRawSize() + (2 * 3 + 2 * 1) // EntityID
+             + 2 * sizeof(SequenceNumber_t) + sizeof(uint32_t);
+    }
+  };
+
   struct SubmessageInfoDST
   {
     SubmessageHeader header;
@@ -264,11 +280,8 @@ namespace rtps
     Count_t count;
     static uint16_t getRawSize(const SequenceNumberSet &set)
     {
-      uint16_t bitMapSize = 0;
-      if (set.numBits != 0)
-      {
-        bitMapSize = 4 * ((set.numBits / 32) + 1);
-      }
+      const uint16_t bitMapSize =
+          static_cast<uint16_t>(SequenceNumberSet::bitmapBytes(set.numBits));
       return getRawSizeWithoutSNSet() + sizeof(SequenceNumber_t) +
              sizeof(uint32_t) + bitMapSize; // SequenceNumberSet
     }
@@ -444,7 +457,7 @@ namespace rtps
     if (msg.readerSNState.numBits != 0)
     {
       buffer.append(reinterpret_cast<uint8_t *>(msg.readerSNState.bitMap.data()),
-                    4 * ((msg.readerSNState.numBits / 32) + 1));
+                    SequenceNumberSet::bitmapBytes(msg.readerSNState.numBits));
     }
     buffer.append(reinterpret_cast<uint8_t *>(&msg.count.value),
                   sizeof(msg.count.value));
@@ -485,6 +498,9 @@ namespace rtps
 
   bool deserializeMessage(const MessageProcessingInfo &info,
                           SubmessageAckNack &msg);
+
+  bool deserializeMessage(const MessageProcessingInfo &info,
+                          SubmessageGap &msg);
 
 } // namespace rtps
 
